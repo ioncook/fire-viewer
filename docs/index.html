@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>California Fire History</title>
+  <meta name="description" content="Explore over 23,000 California wildfire perimeters from 1878 to 2025. Filter by decade, season, and cause using Cal Fire FRAP data." />
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@^5.0.0/dist/maplibre-gl.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+
+<body>
+  <div class="header-bar">
+    <div style="display: flex; align-items: center; gap: 8px;">
+      <h2 style="margin:0; font-size: 18px; white-space: nowrap;">California Fire History</h2>
+      <div class="source-info" style="display: flex; flex-direction: column; gap: 1px; margin-left: 8px; line-height: 1.1;">
+        <span id="status" style="font-size: 11px; color:#555;">Loading…</span>
+        <a href="https://frap.fire.ca.gov/mapping/gis-data/" target="_blank"
+          style="font-size: 10px; color: #444; text-decoration: none;">Cal Fire FRAP Data</a>
+      </div>
+    </div>
+
+    <div class="controls">
+
+
+      <!-- Year range -->
+      <div style="display:flex; align-items:center; gap:4px;">
+        <input type="number" id="year-min" value="1870" min="1870" max="2025" class="num-input" />
+        <span style="color:var(--text-dim); font-size:12px;">–</span>
+        <input type="number" id="year-max" value="2025" min="1870" max="2025" class="num-input" />
+      </div>
+
+      <!-- Cause filter -->
+      <select id="cause-filter">
+        <option value="all">All Causes</option>
+        <option value="1">Lightning</option>
+        <option value="7">Arson</option>
+        <option value="2">Equipment Use</option>
+        <option value="5">Debris</option>
+        <option value="4">Campfire</option>
+        <option value="11">Power Line</option>
+        <option value="10">Vehicle</option>
+        <option value="9">Miscellaneous</option>
+        <option value="14">Unknown</option>
+      </select>
+
+      <!-- Min size -->
+      <input type="number" id="size-filter" placeholder="min size" min="0" class="num-input" style="width:72px;" />
+
+      <!-- Settings -->
+      <div class="settings-dropdown" style="display:flex; align-items:center;">
+        <button id="settings-btn"
+          style="background:none; border:none; display:flex; align-items:center; padding: 0 5px; cursor:pointer;"
+          onclick="toggleSettings(event)">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#888" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="3"></circle>
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+          </svg>
+        </button>
+        <div id="settings-menu" class="settings-content">
+          <div class="setting-row">
+            <span>Theme</span>
+            <select id="theme-select">
+              <option value="dark">Dark Mode</option>
+              <option value="light">Light Mode</option>
+            </select>
+          </div>
+          <div class="setting-row">
+            <span>Basemap</span>
+            <select id="basemap">
+              <option value="dark">Dark Matter</option>
+              <option value="satellite">Satellite</option>
+              <option value="topo">Topography</option>
+              <option value="light">Clean Light Map</option>
+            </select>
+          </div>
+          <div class="setting-row">
+            <span>Fill Opacity</span>
+            <input type="range" id="opacity-slider" min="0" max="100" value="65" style="width: 100px;" />
+          </div>
+          <div class="setting-row">
+            <span>Units</span>
+            <select id="units-select">
+              <option value="imperial">Imperial (acres)</option>
+              <option value="metric">Metric (ha)</option>
+              <option value="sqmi">Square Miles (mi²)</option>
+              <option value="sqkm">Square Kilometers (km²)</option>
+            </select>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="map">
+    <div class="legend-container">
+      <div id="layer-title">By Decade</div>
+      <div id="legend-content" class="legend-items">
+        <!-- Dynamic Legend Injection -->
+      </div>
+    </div>
+  </div>
+
+
+
+  <script src="https://unpkg.com/maplibre-gl@^5.0.0/dist/maplibre-gl.js"></script>
+  <script src="app.js?v=4"></script>
+</body>
+
+</html>
