@@ -4,9 +4,10 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>California Fire History</title>
-  <meta name="description" content="Explore over 23,000 California wildfire perimeters from 1878 to 2025. Filter by decade, season, and cause using Cal Fire FRAP data." />
-  <link rel="icon" href="data:,">
+  <title>Fire Viewer</title>
+  <meta name="description"
+    content="Explore over 23,000 California wildfire perimeters from 1878 to 2025. Filter by decade, season, and cause using Cal Fire FRAP data." />
+  <link rel="icon" href="favicon.png" type="image/png">
   <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@^5.0.0/dist/maplibre-gl.css" />
   <link rel="stylesheet" href="style.css" />
 </head>
@@ -14,8 +15,10 @@
 <body>
   <div class="header-bar">
     <div style="display: flex; align-items: center; gap: 8px;">
-      <h2 style="margin:0; font-size: 18px; white-space: nowrap;">California Fire History</h2>
-      <div class="source-info" style="display: flex; flex-direction: column; gap: 1px; margin-left: 8px; line-height: 1.1;">
+      <img src="logo.png" alt="Fire Viewer Logo" style="height: 24px; width: auto;" />
+      <h2 style="margin:0; font-size: 18px; white-space: nowrap;">Fire Viewer</h2>
+      <div class="source-info"
+        style="display: flex; flex-direction: column; gap: 1px; margin-left: 8px; line-height: 1.1;">
         <span id="status" style="font-size: 11px; color:#555;">Loading…</span>
         <a href="https://frap.fire.ca.gov/mapping/gis-data/" target="_blank"
           style="font-size: 10px; color: #444; text-decoration: none;">Cal Fire FRAP Data</a>
@@ -28,7 +31,7 @@
       <!-- Year range -->
       <div style="display:flex; align-items:center; gap:4px;">
         <input type="number" id="year-min" value="1870" min="1870" max="2025" class="num-input" />
-        <span style="color:var(--text-dim); font-size:12px;">–</span>
+        <span style="color:var(--text-dim); font-size:12px;"> to </span>
         <input type="number" id="year-max" value="2025" min="1870" max="2025" class="num-input" />
       </div>
 
@@ -57,7 +60,9 @@
           <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#888" stroke-width="2"
             stroke-linecap="round" stroke-linejoin="round">
             <circle cx="12" cy="12" r="3"></circle>
-            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+            <path
+              d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z">
+            </path>
           </svg>
         </button>
         <div id="settings-menu" class="settings-content">
@@ -89,6 +94,18 @@
               <option value="sqmi">Square Miles (mi²)</option>
               <option value="sqkm">Square Kilometers (km²)</option>
             </select>
+          </div>
+          <div class="setting-row">
+            <span>3D Relief &amp; Hillshade</span>
+            <label class="switch">
+              <input type="checkbox" id="hillshade-check">
+              <span class="slider"></span>
+            </label>
+          </div>
+          <div class="setting-row">
+            <span>3D Exaggeration</span>
+            <input type="number" id="terrain-exaggeration" step="0.1" min="0" max="20" value="2.0"
+              style="width: 60px; background:var(--btn-bg); color:var(--text); border:1px solid var(--border); border-radius:4px; padding:2px 5px;">
           </div>
         </div>
       </div>
