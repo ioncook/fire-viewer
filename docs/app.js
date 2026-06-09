@@ -470,6 +470,7 @@ function updateStats() {
   if (statusEl) {
     const isFiltered = activeFilters.yearMin > 1870 || activeFilters.yearMax < 2025
       || activeFilters.cause !== 'all' || activeFilters.size > 0;
+    const label = isFiltered ? 'Filtered' : 'All fires';
     const isLoading = Object.values(loadedStates).includes('loading');
     const loadingStr = isLoading ? ' (loading detail...)' : '';
     statusEl.textContent = `${label} · ${formatCount(filteredCount)} shown${loadingStr}`;
