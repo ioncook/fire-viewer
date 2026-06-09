@@ -3,7 +3,7 @@ maplibregl.prewarm();
 maplibregl.workerCount = Math.max(2, navigator.hardwareConcurrency || 2);
 
 // ---- Global State ----
-let allFeatures = [];       // raw GeoJSON features
+let allFeatures = [];       // raw GeoJSON features (contains fires.geojson)
 let currentPopup = null;
 let currentBasemap = 'dark';
 let colorMode = 'decade';
@@ -14,8 +14,13 @@ let filteredCount = 0;
 let filteredAcres = 0;
 let filteredLargest = '';
 let dataLoaded = false;
-let terrainEnabled = false;
+let highResLoaded = false;
+let loadedStates = {};
+let highResFeatures = [];
+let terrainMode = 'off';
 let terrainExaggeration = 1.5;
+let currentProjection = 'mercator'; // 'mercator' | 'globe'
+let currentBorders = 'state';
 
 // ---- Settings Persistence ----
 function saveSettings() {
@@ -24,8 +29,10 @@ function saveSettings() {
     basemap: currentBasemap,
     opacity: opacityVal,
     colorMode: colorMode,
-    terrain: terrainEnabled,
+    terrain: terrainMode,
     exaggeration: terrainExaggeration,
+    projection: currentProjection,
+    borders: currentBorders,
     theme: document.body.classList.contains('light-mode') ? 'light' : 'dark'
   };
   localStorage.setItem('fire_visualizer_settings', JSON.stringify(settings));
@@ -40,7 +47,15 @@ function loadSettings() {
       if (s.basemap) currentBasemap = s.basemap;
       if (s.opacity !== undefined) opacityVal = s.opacity;
       if (s.colorMode) colorMode = s.colorMode;
-      if (s.terrain !== undefined) terrainEnabled = s.terrain;
+      if (s.projection) currentProjection = s.projection;
+      if (s.borders) currentBorders = s.borders;
+      if (s.terrain !== undefined) {
+        if (typeof s.terrain === 'boolean') {
+          terrainMode = s.terrain ? '3d' : 'off';
+        } else {
+          terrainMode = s.terrain;
+        }
+      }
       if (s.exaggeration !== undefined) terrainExaggeration = s.exaggeration;
       if (s.theme) document.body.classList.toggle('light-mode', s.theme === 'light');
     } catch (e) { console.warn('Failed to load settings', e); }
@@ -83,12 +98,11 @@ function getSeason(dateStr) {
 
 // ---- Color palettes ----
 const DECADE_COLORS = {
-  1870: '#4a1942', 1890: '#6b2d5e', 1900: '#8b3a76',
-  1910: '#a84090', 1920: '#c44daa', 1930: '#d45a9a',
-  1940: '#e06a80', 1950: '#e87c60',
-  1960: '#f08040', 1970: '#f59030',
-  1980: '#f9a020', 1990: '#fcb015',
-  2000: '#fd8c0a', 2010: '#fd5c0a', 2020: '#ff2200'
+  1870: '#9c27b0', 1890: '#673ab7', 1900: '#3f51b5',
+  1910: '#2196f3', 1920: '#03a9f4', 1930: '#00bcd4',
+  1940: '#009688', 1950: '#4caf50', 1960: '#8bc34a',
+  1970: '#cddc39', 1980: '#ffeb3b', 1990: '#ffc107',
+  2000: '#ff9800', 2010: '#ff5722', 2020: '#f44336'
 };
 
 const CAUSE_COLORS = {
@@ -113,8 +127,8 @@ const YEAR_COLOR_STOPS = Object.entries(DECADE_COLORS)
   .map(([y, c]) => [parseInt(y), c]);
 
 const SIZE_COLOR_STOPS = [
-  [0, '#ffe066'], [100, '#ffcc00'], [1000, '#ffa500'],
-  [10000, '#ff8800'], [50000, '#ff5500'], [100000, '#ff3300'], [500000, '#ff0000']
+  [0, '#00b4d8'], [100, '#00f5d4'], [1000, '#4caf50'],
+  [10000, '#ffeb3b'], [50000, '#ff9800'], [100000, '#f44336'], [500000, '#9c27b0']
 ];
 
 function lerpHex(c1, c2, t) {
@@ -142,7 +156,8 @@ function getFeatureColor(props) {
   const year = props.y || 0;
   const cause = props.c || 14;
   const acres = props.ac || 0;
-  const season = getSeason(props.ad);
+  const SEASON_NAMES = { 1: 'Spring', 2: 'Summer', 3: 'Fall', 4: 'Winter' };
+  const season = SEASON_NAMES[props.se] || 'Unknown';
 
   if (colorMode === 'decade') return interpolateColor(YEAR_COLOR_STOPS, year);
   if (colorMode === 'cause') return CAUSE_COLORS[cause] || '#888';
@@ -169,10 +184,9 @@ const BASEMAP_ATTRS = {
 const map = new maplibregl.Map({
   container: 'map',
   style: { version: 8, sources: {}, layers: [] },
-  center: [-119.5, 37.3],
-  zoom: 5.5,
+  center: [-116.0, 44.0],
+  zoom: 4.0,
   maxZoom: 16,
-  minZoom: 4,
   antialias: true,
   trackResize: true,
   attributionControl: true,
@@ -204,7 +218,125 @@ function loadHash() {
   }
 }
 loadHash();
-map.on('moveend', updateHash);
+
+function loadStateHighRes(code) {
+  if (loadedStates[code]) return;
+  loadedStates[code] = 'loading';
+
+  const statusEl = document.getElementById('status');
+  if (statusEl) statusEl.textContent = `Loading details for ${code}…`;
+
+  fetch(`./states/fires_${code}.geojson`)
+    .then(r => {
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      return r.json();
+    })
+    .then(geojson => {
+      const features = geojson.features || [];
+      processFeatures(features);
+
+      // Merge new high-res features
+      highResFeatures = highResFeatures.concat(features);
+      loadedStates[code] = 'loaded';
+
+      // Replace low-res features in allFeatures
+      allFeatures = allFeatures.filter(f => !(f.properties && f.properties.st === code));
+      allFeatures = allFeatures.concat(features);
+
+      const loadedList = Object.keys(loadedStates).filter(k => loadedStates[k] === 'loaded').join(', ');
+      if (statusEl) {
+        statusEl.textContent = `Loaded detail for ${loadedList}`;
+      }
+
+      updateViewportData();
+      updateStats();
+    })
+    .catch(err => {
+      console.error(`Failed to load high-res perimeters for ${code}:`, err);
+      loadedStates[code] = null; // allow retry
+    });
+}
+
+function updateViewportData() {
+  if (!dataLoaded) return;
+
+  const zoom = map.getZoom();
+
+  // If zoomed out, clear high-res source to free memory and CPU
+  if (zoom < 6.5) {
+    const source = map.getSource('fires-source');
+    if (source) {
+      source.setData({ type: 'FeatureCollection', features: [] });
+    }
+    return;
+  }
+
+  const bounds = map.getBounds();
+  const west = bounds.getWest();
+  const east = bounds.getEast();
+  const south = bounds.getSouth();
+  const north = bounds.getNorth();
+
+  // Add 10% padding buffer around viewport to avoid edge clipping / pop-in during small pans
+  const padLng = (east - west) * 0.1;
+  const padLat = (north - south) * 0.1;
+
+  const w = west - padLng;
+  const e = east + padLng;
+  const s = south - padLat;
+  const n = north + padLat;
+
+  // Identify visible states and trigger background load
+  for (const [code, stBounds] of Object.entries(STATE_BOUNDS)) {
+    const stMinLng = stBounds[0][0];
+    const stMinLat = stBounds[0][1];
+    const stMaxLng = stBounds[1][0];
+    const stMaxLat = stBounds[1][1];
+
+    if (stMaxLng >= w && stMinLng <= e && stMaxLat >= s && stMinLat <= n) {
+      if (!loadedStates[code]) {
+        loadStateHighRes(code);
+      }
+    }
+  }
+
+  // Filter whatever features are in allFeatures (handles both loaded high-res and fallback low-res)
+  const filtered = [];
+  for (let i = 0; i < allFeatures.length; i++) {
+    const feat = allFeatures[i];
+    if (feat.bbox) {
+      const [fW, fS, fE, fN] = feat.bbox;
+      if (fE >= w && fW <= e && fN >= s && fS <= n) {
+        filtered.push(feat);
+      }
+    } else {
+      filtered.push(feat);
+    }
+  }
+
+  const source = map.getSource('fires-source');
+  if (source) {
+    source.setData({
+      type: 'FeatureCollection',
+      features: filtered
+    });
+  }
+}
+
+let lastZoom = map.getZoom();
+map.on('zoom', () => {
+  const zoom = map.getZoom();
+  // Only trigger updates immediately when crossing the visibility threshold
+  if ((zoom >= 6.5 && lastZoom < 6.5) || (zoom < 6.5 && lastZoom >= 6.5)) {
+    updateViewportData();
+  }
+  lastZoom = zoom;
+});
+
+map.on('moveend', () => {
+  updateHash();
+  updateViewportData();
+});
 
 map.addControl(new maplibregl.NavigationControl({ showCompass: false }), 'bottom-right');
 
@@ -228,14 +360,45 @@ function setupBasemap(id) {
   map.addLayer({
     id: 'basemap-layer', type: 'raster', source: 'basemap-source',
     paint: { 'raster-fade-duration': 0 }
-  }, 'fires-fill' in map.style._layers ? 'fires-fill' : undefined);
+  }, 'overlay-anchor');
 
   currentBasemap = id;
 }
 
-// ---- 3D Terrain ----
-function setupTerrain(enable, exaggeration = terrainExaggeration) {
-  if (enable) {
+// ---- Projection setup ----
+function setupProjection(type) {
+  currentProjection = type;
+  map.setProjection({ type: type });
+}
+
+// ---- 3D Terrain & Hillshade ----
+function setupTerrain(mode, exaggeration = terrainExaggeration) {
+  terrainMode = mode;
+  terrainExaggeration = parseFloat(exaggeration);
+  const viz = (mode === 'hillshade' || mode === '3d') ? 'visible' : 'none';
+
+  if (mode === '3d') {
+    if (!map.getSource('terrain-source')) {
+      map.addSource('terrain-source', {
+        type: 'raster-dem',
+        tiles: ['https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png'],
+        encoding: 'terrarium',
+        tileSize: 256,
+        maxzoom: 15
+      });
+    }
+    map.setTerrain({ source: 'terrain-source', exaggeration: terrainExaggeration });
+  } else {
+    map.setTerrain(null);
+    try {
+      if (map.painter && map.painter.terrain) map.painter.terrain = null;
+      if (map.transform && map.transform._elevation !== undefined) map.transform._elevation = 0;
+      if (map.transform && map.transform.elevation !== undefined) map.transform.elevation = 0;
+    } catch (e) { }
+    map.triggerRepaint();
+  }
+
+  if (viz === 'visible') {
     if (!map.getSource('terrain-source')) {
       map.addSource('terrain-source', {
         type: 'raster-dem',
@@ -246,40 +409,27 @@ function setupTerrain(enable, exaggeration = terrainExaggeration) {
       });
     }
 
-    // 3D Elevation
-    map.setTerrain({ source: 'terrain-source', exaggeration: parseFloat(exaggeration) });
-
-    // Hillshading for visual depth
     if (!map.getLayer('hillshade-layer')) {
       map.addLayer({
         id: 'hillshade-layer',
         type: 'hillshade',
         source: 'terrain-source',
         paint: {
-          'hillshade-exaggeration': 0.6,
-          'hillshade-shadow-color': '#000',
-          'hillshade-highlight-color': '#fff',
-          'hillshade-accent-color': '#000'
+          'hillshade-exaggeration': 0.4,
+          'hillshade-shadow-color': 'rgba(0,0,0,0.5)',
+          'hillshade-highlight-color': 'rgba(255,255,255,0.1)'
         }
-      }, map.getLayer('basemap-layer') ? 'basemap-layer' : undefined);
-      // Wait, we want hillshade ABOVE basemap? Usually yes.
-      // If we put it before 'basemap-layer', it's below it.
-      // If we omit second arg, it's at the top (above fires).
-      // We want it between basemap and fires.
-      if (map.getLayer('basemap-layer') && map.getLayer('fires-fill')) {
-        map.moveLayer('hillshade-layer', 'fires-fill');
-      }
+      });
     } else {
       map.setLayoutProperty('hillshade-layer', 'visibility', 'visible');
     }
+    // Make sure hillshade layer is ALWAYS on top of the fires
+    map.moveLayer('hillshade-layer');
   } else {
-    map.setTerrain(null);
     if (map.getLayer('hillshade-layer')) {
       map.setLayoutProperty('hillshade-layer', 'visibility', 'none');
     }
   }
-  terrainEnabled = enable;
-  terrainExaggeration = parseFloat(exaggeration);
 }
 
 // ---- Filter logic ----
@@ -295,6 +445,7 @@ function matchesFilters(props) {
   return true;
 }
 
+// ---- Calculate Stats & Update Sidebar ----
 // ---- Calculate Stats & Update Sidebar ----
 function updateStats() {
   let count = 0, acres = 0, largestAc = 0, largestName = '';
@@ -319,8 +470,9 @@ function updateStats() {
   if (statusEl) {
     const isFiltered = activeFilters.yearMin > 1870 || activeFilters.yearMax < 2025
       || activeFilters.cause !== 'all' || activeFilters.size > 0;
-    const label = isFiltered ? 'Filtered' : 'All fires';
-    statusEl.textContent = `${label} · ${formatCount(filteredCount)} shown`;
+    const isLoading = Object.values(loadedStates).includes('loading');
+    const loadingStr = isLoading ? ' (loading detail...)' : '';
+    statusEl.textContent = `${label} · ${formatCount(filteredCount)} shown${loadingStr}`;
   }
 }
 
@@ -355,20 +507,17 @@ function buildColorExpression() {
     const flat = SIZE_COLOR_STOPS.flatMap(([s, c]) => [s, c]);
     base = ['interpolate', ['linear'], ['get', 'ac'], ...flat];
   } else if (colorMode === 'season') {
-    base = ['case',
-      ['all', ['!=', ['get', 'ad'], ''], ['>=', ['to-number', ['slice', ['get', 'ad'], 5, 7]], 3], ['<=', ['to-number', ['slice', ['get', 'ad'], 5, 7]], 5]],
-      '#81c784',
-      ['all', ['!=', ['get', 'ad'], ''], ['>=', ['to-number', ['slice', ['get', 'ad'], 5, 7]], 6], ['<=', ['to-number', ['slice', ['get', 'ad'], 5, 7]], 8]],
-      '#ff8f00',
-      ['all', ['!=', ['get', 'ad'], ''], ['>=', ['to-number', ['slice', ['get', 'ad'], 5, 7]], 9], ['<=', ['to-number', ['slice', ['get', 'ad'], 5, 7]], 11]],
-      '#e53935',
-      '#7986cb'
+    base = ['match', ['get', 'se'],
+      1, '#81c784', // Spring
+      2, '#ff8f00', // Summer
+      3, '#e53935', // Fall
+      4, '#7986cb', // Winter
+      '#7986cb'     // Default (Winter)
     ];
   } else {
     base = '#ff5c1a';
   }
 
-  // Return base for outlines, but for fills we can use a hover check if we want
   return base;
 }
 
@@ -378,6 +527,24 @@ function applyFireLayers() {
   const colorExpr = buildColorExpression();
   const filterExpr = buildMapFilter();
 
+  // Apply to low-res layers if present
+  if (map.getSource('fires-lowres-source')) {
+    if (map.getLayer('fires-fill-lowres')) {
+      map.setFilter('fires-fill-lowres', filterExpr);
+      map.setPaintProperty('fires-fill-lowres', 'fill-color', colorExpr);
+      map.setPaintProperty('fires-fill-lowres', 'fill-opacity', ['case',
+        ['any', ['boolean', ['feature-state', 'hover'], false], ['boolean', ['feature-state', 'popup'], false]],
+        Math.min(opacityVal + 0.35, 1.0),
+        opacityVal * 0.75
+      ]);
+    }
+    if (map.getLayer('fires-outline-lowres')) {
+      map.setFilter('fires-outline-lowres', filterExpr);
+      map.setPaintProperty('fires-outline-lowres', 'line-color', colorExpr);
+    }
+  }
+
+  // Apply to high-res layers if present
   if (map.getSource('fires-source')) {
     if (map.getLayer('fires-fill')) {
       map.setFilter('fires-fill', filterExpr);
@@ -392,49 +559,11 @@ function applyFireLayers() {
       map.setFilter('fires-outline', filterExpr);
       map.setPaintProperty('fires-outline', 'line-color', colorExpr);
     }
-  } else {
-    map.addSource('fires-source', {
-      type: 'geojson',
-      data: { type: 'FeatureCollection', features: allFeatures },
-      generateId: true
-    });
+    updateViewportData();
+  }
 
-    // Base fill
-    map.addLayer({
-      id: 'fires-fill',
-      type: 'fill',
-      source: 'fires-source',
-      filter: filterExpr,
-      paint: {
-        'fill-color': colorExpr,
-        'fill-opacity': ['case',
-          ['any', ['boolean', ['feature-state', 'hover'], false], ['boolean', ['feature-state', 'popup'], false]],
-          Math.min(opacityVal + 0.35, 1.0),
-          opacityVal * 0.75
-        ],
-        'fill-antialias': true
-      }
-    });
-
-    // Outline layer
-    map.addLayer({
-      id: 'fires-outline',
-      type: 'line',
-      source: 'fires-source',
-      filter: filterExpr,
-      paint: {
-        'line-color': colorExpr,
-        'line-width': ['interpolate', ['linear'], ['zoom'],
-          5, 0.3,
-          9, 0.8,
-          12, 1.2
-        ],
-        'line-opacity': ['case',
-          ['any', ['boolean', ['feature-state', 'hover'], false], ['boolean', ['feature-state', 'popup'], false]],
-          1.0, 0.6
-        ]
-      }
-    });
+  if (map.getLayer('hillshade-layer') && map.getLayoutProperty('hillshade-layer', 'visibility') !== 'none') {
+    map.moveLayer('hillshade-layer');
   }
   updateLegend();
 }
@@ -449,30 +578,63 @@ map.on('rotateend', () => { map.getCanvas().style.cursor = 'grab'; });
 
 // ---- Hover & Popup state ----
 let hoveredId = null;
+let hoveredSource = null;
 let popupActiveId = null;
+let popupActiveSource = null;
 
-map.on('mousemove', 'fires-fill', (e) => {
-  map.getCanvas().style.cursor = 'pointer';
-  if (e.features && e.features.length > 0) {
-    // Highlight the smallest fire (lowest acres)
-    const sorted = e.features.slice().sort((a, b) => (a.properties.ac || 0) - (b.properties.ac || 0));
-    const topFeature = sorted[0];
+function setupFireLayerEvents(layerId, sourceId) {
+  map.on('mousemove', layerId, (e) => {
+    map.getCanvas().style.cursor = 'pointer';
+    if (e.features && e.features.length > 0) {
+      const sorted = e.features.slice().sort((a, b) => (a.properties.ac || 0) - (b.properties.ac || 0));
+      const topFeature = sorted[0];
 
-    if (hoveredId !== null && hoveredId !== topFeature.id) {
-      map.setFeatureState({ source: 'fires-source', id: hoveredId }, { hover: false });
+      if (hoveredId !== null && (hoveredId !== topFeature.id || hoveredSource !== sourceId)) {
+        try {
+          map.setFeatureState({ source: hoveredSource, id: hoveredId }, { hover: false });
+        } catch (err) {}
+      }
+      hoveredId = topFeature.id;
+      hoveredSource = sourceId;
+      map.setFeatureState({ source: hoveredSource, id: hoveredId }, { hover: true });
     }
-    hoveredId = topFeature.id;
-    map.setFeatureState({ source: 'fires-source', id: hoveredId }, { hover: true });
-  }
-});
+  });
 
-map.on('mouseleave', 'fires-fill', () => {
-  if (!map.isMoving()) map.getCanvas().style.cursor = 'grab';
-  if (hoveredId !== null) {
-    map.setFeatureState({ source: 'fires-source', id: hoveredId }, { hover: false });
-  }
-  hoveredId = null;
-});
+  map.on('mouseleave', layerId, () => {
+    if (!map.isMoving()) map.getCanvas().style.cursor = 'grab';
+    if (hoveredId !== null && hoveredSource !== null) {
+      try {
+        map.setFeatureState({ source: hoveredSource, id: hoveredId }, { hover: false });
+      } catch (err) {}
+    }
+    hoveredId = null;
+    hoveredSource = null;
+  });
+
+  map.on('click', layerId, (e) => {
+    if (!e.features || e.features.length === 0) return;
+
+    clickFeatures = e.features.slice().sort((a, b) =>
+      (a.properties.ac || 0) - (b.properties.ac || 0) ||
+      (b.properties.y || 0) - (a.properties.y || 0)
+    );
+    clickIndex = 0;
+    currentPopupLngLat = e.lngLat;
+    currentCounty = '';
+
+    fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${e.lngLat.lat}&lon=${e.lngLat.lng}&zoom=10`)
+      .then(r => r.json())
+      .then(data => {
+        if (data && data.address && data.address.county) {
+          currentCounty = data.address.county;
+          if (currentPopup && currentPopup.isOpen()) renderFirePopup();
+        }
+      })
+      .catch(() => { });
+
+    renderFirePopup();
+  });
+}
 
 // ---- Popup builder ----
 function buildFirePopupHTML() {
@@ -485,7 +647,8 @@ function buildFirePopupHTML() {
   const agency = AGENCY_LABELS[props.ag] || props.ag || 'Unknown';
   const acres = props.ac ? formatAcres(props.ac) : '—';
   const cause = CAUSE_LABELS[props.c] || 'Unknown';
-  const season = getSeason(props.ad);
+  const SEASON_NAMES = { 1: 'Spring', 2: 'Summer', 3: 'Fall', 4: 'Winter' };
+  const season = SEASON_NAMES[props.se] || 'Unknown';
   const dur = calcDuration(props.ad, props.cd);
 
   const decadeColor = interpolateColor(YEAR_COLOR_STOPS, year);
@@ -510,7 +673,6 @@ function buildFirePopupHTML() {
     }
   }
 
-  // Nav arrows — horizontal, pushed to the right side
   const prevDisabled = idx === 0;
   const nextDisabled = idx === total - 1;
   const navHtml = total > 1 ? `
@@ -557,14 +719,21 @@ function buildFirePopupHTML() {
 function renderFirePopup() {
   const html = buildFirePopupHTML();
 
-  // Update dedicated popup highlight state
   const feat = clickFeatures[clickIndex];
   if (feat && feat.id !== undefined) {
-    if (popupActiveId !== null && popupActiveId !== feat.id) {
-      map.setFeatureState({ source: 'fires-source', id: popupActiveId }, { popup: false });
+    const sourceId = feat.source || (feat.layer ? feat.layer.source : null);
+    if (popupActiveId !== null && (popupActiveId !== feat.id || popupActiveSource !== sourceId)) {
+      try {
+        map.setFeatureState({ source: popupActiveSource, id: popupActiveId }, { popup: false });
+      } catch (err) {}
     }
     popupActiveId = feat.id;
-    map.setFeatureState({ source: 'fires-source', id: popupActiveId }, { popup: true });
+    popupActiveSource = sourceId;
+    if (popupActiveSource) {
+      try {
+        map.setFeatureState({ source: popupActiveSource, id: popupActiveId }, { popup: true });
+      } catch (err) {}
+    }
   }
 
   if (currentPopup && currentPopup.isOpen()) {
@@ -581,9 +750,12 @@ function renderFirePopup() {
       .setHTML(html);
 
     currentPopup.on('close', () => {
-      if (popupActiveId !== null) {
-        map.setFeatureState({ source: 'fires-source', id: popupActiveId }, { popup: false });
+      if (popupActiveId !== null && popupActiveSource) {
+        try {
+          map.setFeatureState({ source: popupActiveSource, id: popupActiveId }, { popup: false });
+        } catch (err) {}
         popupActiveId = null;
+        popupActiveSource = null;
       }
     });
 
@@ -618,33 +790,6 @@ window.firePopupNav = function (dir) {
   clickIndex = next;
   renderFirePopup();
 };
-
-// ---- Click popup ----
-map.on('click', 'fires-fill', (e) => {
-  if (!e.features || e.features.length === 0) return;
-
-  // Sort by acres ascending (smallest first), break ties by year descending
-  clickFeatures = e.features.slice().sort((a, b) =>
-    (a.properties.ac || 0) - (b.properties.ac || 0) ||
-    (b.properties.y || 0) - (a.properties.y || 0)
-  );
-  clickIndex = 0;
-  currentPopupLngLat = e.lngLat;
-  currentCounty = '';
-
-  // Fetch county via reverse geocoding
-  fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${e.lngLat.lat}&lon=${e.lngLat.lng}&zoom=10`)
-    .then(r => r.json())
-    .then(data => {
-      if (data && data.address && data.address.county) {
-        currentCounty = data.address.county;
-        if (currentPopup && currentPopup.isOpen()) renderFirePopup();
-      }
-    })
-    .catch(() => { });
-
-  renderFirePopup();
-});
 
 // Double-right-click to reset pitch/bearing
 let lastRightClick = 0;
@@ -684,20 +829,37 @@ const UNIT_LABEL = {
   sqkm: 'km²',
 };
 
-function formatAcres(ac) {
+function formatAcresValue(ac) {
   const v = acToDisplay(ac);
+  if (v === 0) return '0';
+  let suffix = '';
+  let value = v;
+  if (v >= 1000000) {
+    value = v / 1000000;
+    suffix = 'M';
+  } else if (v >= 1000) {
+    value = v / 1000;
+    suffix = 'K';
+  }
+  
+  let formatted = '';
+  if (value >= 100) {
+    formatted = value.toFixed(0);
+  } else if (value >= 10) {
+    formatted = value.toFixed(1);
+  } else {
+    formatted = value.toFixed(2);
+  }
+  return formatted + suffix;
+}
+
+function formatAcres(ac) {
   const unit = UNIT_LABEL[currentUnits] || 'acres';
-  if (v >= 1000000) return (v / 1000000).toFixed(2) + 'M ' + unit;
-  if (v >= 1000) return (v / 1000).toFixed(1) + 'K ' + unit;
-  return Math.round(v).toLocaleString() + ' ' + unit;
+  return formatAcresValue(ac) + ' ' + unit;
 }
 
 function formatAcresShort(ac) {
-  const v = acToDisplay(ac);
-  const unit = UNIT_LABEL[currentUnits] || 'acres';
-  if (v >= 1000000) return (v / 1000000).toFixed(1) + 'M ' + unit;
-  if (v >= 1000) return Math.round(v / 1000) + 'K ' + unit;
-  return Math.round(v).toLocaleString() + ' ' + unit;
+  return formatAcres(ac);
 }
 
 function formatCount(n) {
@@ -764,11 +926,250 @@ function updateLegend() {
 }
 
 
+const STATE_BOUNDS = {
+  CA: [[-124.48, 32.53], [-114.13, 42.01]],
+  AK: [[-179.15, 51.21], [-129.98, 71.39]],
+  AZ: [[-114.82, 31.33], [-109.04, 37.0]],
+  CO: [[-109.06, 36.99], [-102.04, 41.0]],
+  ID: [[-117.24, 41.99], [-111.04, 49.0]],
+  MT: [[-116.05, 44.36], [-104.04, 49.0]],
+  NV: [[-120.01, 35.0], [-114.04, 42.0]],
+  NM: [[-109.05, 31.33], [-103.0, 37.0]],
+  OR: [[-124.65, 41.99], [-116.46, 46.29]],
+  UT: [[-114.05, 37.0], [-109.04, 42.0]],
+  WA: [[-124.85, 45.54], [-116.92, 49.0]],
+  WY: [[-111.05, 41.0], [-104.05, 45.0]]
+};
+
+
+
+function updateBorders() {
+  const mode = document.getElementById('borders-select').value;
+  currentBorders = mode;
+  saveSettings();
+
+  if (!map.getSource('borders-source')) {
+    map.addSource('borders-source', {
+      type: 'geojson',
+      data: './borders.json'
+    });
+  }
+  if (!map.getSource('state-borders-source')) {
+    map.addSource('state-borders-source', {
+      type: 'geojson',
+      data: './borders_state.json'
+    });
+  }
+
+  const borderColor = '#000000';
+  const borderOpacity = 1.0;
+  const stateBorderColor = '#000000';
+  const stateBorderOpacity = 0.5;
+
+  // Handle National Borders
+  if (mode === 'national' || mode === 'state') {
+    if (!map.getLayer('borders-layer')) {
+      map.addLayer({
+        id: 'borders-layer',
+        type: 'line',
+        source: 'borders-source',
+        paint: {
+          'line-color': borderColor,
+          'line-width': 1.0,
+          'line-opacity': borderOpacity
+        }
+      });
+    } else {
+      map.setLayoutProperty('borders-layer', 'visibility', 'visible');
+      map.setPaintProperty('borders-layer', 'line-color', borderColor);
+      map.setPaintProperty('borders-layer', 'line-opacity', borderOpacity);
+    }
+    map.moveLayer('borders-layer'); // Enforce top layering
+  } else {
+    if (map.getLayer('borders-layer')) map.setLayoutProperty('borders-layer', 'visibility', 'none');
+  }
+
+  // Handle State Borders
+  if (mode === 'state') {
+    if (!map.getLayer('state-borders-layer')) {
+      map.addLayer({
+        id: 'state-borders-layer',
+        type: 'line',
+        source: 'state-borders-source',
+        paint: {
+          'line-color': stateBorderColor,
+          'line-width': 0.75,
+          'line-opacity': stateBorderOpacity
+        }
+      });
+    } else {
+      map.setLayoutProperty('state-borders-layer', 'visibility', 'visible');
+      map.setPaintProperty('state-borders-layer', 'line-color', stateBorderColor);
+      map.setPaintProperty('state-borders-layer', 'line-opacity', stateBorderOpacity);
+    }
+    if (map.getLayer('borders-layer')) {
+      map.moveLayer('state-borders-layer', 'borders-layer');
+    } else {
+      map.moveLayer('state-borders-layer');
+    }
+  } else {
+    if (map.getLayer('state-borders-layer')) map.setLayoutProperty('state-borders-layer', 'visibility', 'none');
+  }
+}
+
+function processFeatures(features) {
+  for (let i = 0; i < features.length; i++) {
+    const props = features[i].properties;
+    if (props) {
+      const ad = props.ad;
+      let se = 4; // Default to Winter (4)
+      if (ad && ad.length >= 7) {
+        const m = parseInt(ad.slice(5, 7), 10);
+        if (m >= 3 && m <= 5) se = 1;      // Spring
+        else if (m >= 6 && m <= 8) se = 2; // Summer
+        else if (m >= 9 && m <= 11) se = 3;// Fall
+      }
+      props.se = se;
+    }
+  }
+}
+
+function loadInitialData() {
+  const statusEl = document.getElementById('status');
+  if (statusEl) statusEl.textContent = 'Loading low-res overview…';
+
+  dataLoaded = false;
+  highResLoaded = false;
+  loadedStates = {};
+  highResFeatures = [];
+
+  // 1. Fetch low-res overview
+  fetch('./fires_lowres.geojson')
+    .then(r => {
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      return r.json();
+    })
+    .then(geojson => {
+      const features = geojson.features || [];
+      processFeatures(features);
+      
+      // Populate allFeatures immediately for stats & search
+      allFeatures = features;
+      dataLoaded = true;
+
+      // Add low-res source and layers
+      if (!map.getSource('fires-lowres-source')) {
+        map.addSource('fires-lowres-source', {
+          type: 'geojson',
+          data: geojson,
+          generateId: true,
+          tolerance: 0
+        });
+
+        const colorExpr = buildColorExpression();
+        const filterExpr = buildMapFilter();
+
+        map.addLayer({
+          id: 'fires-fill-lowres',
+          type: 'fill',
+          source: 'fires-lowres-source',
+          maxzoom: 7,
+          filter: filterExpr,
+          paint: {
+            'fill-color': colorExpr,
+            'fill-opacity': ['case',
+              ['any', ['boolean', ['feature-state', 'hover'], false], ['boolean', ['feature-state', 'popup'], false]],
+              Math.min(opacityVal + 0.35, 1.0),
+              opacityVal * 0.75
+            ],
+            'fill-antialias': true
+          }
+        });
+
+        map.addLayer({
+          id: 'fires-outline-lowres',
+          type: 'line',
+          source: 'fires-lowres-source',
+          maxzoom: 7,
+          filter: filterExpr,
+          paint: {
+            'line-color': colorExpr,
+            'line-width': ['interpolate', ['linear'], ['zoom'],
+              5, 0.3,
+              7, 0.6
+            ],
+            'line-opacity': 1.0
+          }
+        });
+
+        setupFireLayerEvents('fires-fill-lowres', 'fires-lowres-source');
+      }
+
+      // Add empty high-res source (initially empty) and layers
+      if (!map.getSource('fires-source')) {
+        map.addSource('fires-source', {
+          type: 'geojson',
+          data: { type: 'FeatureCollection', features: [] },
+          generateId: true,
+          tolerance: 0
+        });
+
+        const colorExpr = buildColorExpression();
+        const filterExpr = buildMapFilter();
+
+        map.addLayer({
+          id: 'fires-fill',
+          type: 'fill',
+          source: 'fires-source',
+          minzoom: 7,
+          filter: filterExpr,
+          paint: {
+            'fill-color': colorExpr,
+            'fill-opacity': ['case',
+              ['any', ['boolean', ['feature-state', 'hover'], false], ['boolean', ['feature-state', 'popup'], false]],
+              Math.min(opacityVal + 0.35, 1.0),
+              opacityVal * 0.75
+            ],
+            'fill-antialias': true
+          }
+        });
+
+        map.addLayer({
+          id: 'fires-outline',
+          type: 'line',
+          source: 'fires-source',
+          minzoom: 7,
+          filter: filterExpr,
+          paint: {
+            'line-color': colorExpr,
+            'line-width': ['interpolate', ['linear'], ['zoom'],
+              7, 0.6,
+              9, 0.8,
+              12, 1.2
+            ],
+            'line-opacity': 1.0
+          }
+        });
+
+        setupFireLayerEvents('fires-fill', 'fires-source');
+      }
+
+      applyFireLayers();
+    })
+    .catch(err => {
+      console.error('Error loading data:', err);
+      if (statusEl && !dataLoaded) {
+        statusEl.textContent = 'Error loading fires';
+      }
+    });
+}
+
 // ---- Main map load ----
 map.on('load', () => {
-  map.addLayer({ id: 'bottom-anchor', type: 'background', paint: { 'background-opacity': 0 } });
+  map.addLayer({ id: 'overlay-anchor', type: 'background', paint: { 'background-opacity': 0 } });
 
   setupBasemap(currentBasemap);
+  setupProjection(currentProjection);
 
   // Sync UI with loaded settings
   document.getElementById('year-min').value = activeFilters.yearMin;
@@ -776,33 +1177,26 @@ map.on('load', () => {
   document.getElementById('cause-filter').value = activeFilters.cause;
   document.getElementById('size-filter').value = activeFilters.size > 0 ? (activeFilters.size / (currentUnits === 'metric' ? 1 / 0.404686 : 1)).toFixed(0) : '';
   document.getElementById('basemap').value = currentBasemap;
+  document.getElementById('projection-select').value = currentProjection;
+  document.getElementById('borders-select').value = currentBorders;
   document.getElementById('units-select').value = currentUnits;
   document.getElementById('opacity-slider').value = opacityVal * 100;
   document.getElementById('theme-select').value = document.body.classList.contains('light-mode') ? 'light' : 'dark';
-  document.getElementById('hillshade-check').checked = terrainEnabled;
+  document.getElementById('terrain-select').value = terrainMode;
   document.getElementById('terrain-exaggeration').value = terrainExaggeration;
 
-  const statusEl = document.getElementById('status');
-  if (statusEl) statusEl.textContent = 'Loading data…';
+  setupTerrain(terrainMode, terrainExaggeration);
 
-  setupTerrain(terrainEnabled, terrainExaggeration);
-
-  fetch('./fires.geojson')
-    .then(r => {
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      return r.json();
-    })
-    .then(geojson => {
-      allFeatures = geojson.features || [];
-      dataLoaded = true;
-      applyFireLayers();
-      updateStats();
-    })
-    .catch(err => {
-      console.error('Failed to load fires.geojson:', err);
-      if (statusEl) statusEl.textContent = 'Error loading data';
-    });
+  updateBorders();
+  loadInitialData();
 });
+
+document.getElementById('projection-select').addEventListener('change', e => {
+  setupProjection(e.target.value);
+  saveSettings();
+});
+
+document.getElementById('borders-select').addEventListener('change', updateBorders);
 
 // ---- Filter event listeners ----
 function applyYearFilter() {
@@ -848,14 +1242,31 @@ document.getElementById('basemap').addEventListener('change', e => {
 
 document.getElementById('opacity-slider').addEventListener('input', e => {
   opacityVal = parseInt(e.target.value) / 100;
-  saveSettings();
-  if (map.getLayer('fires-fill')) {
-    map.setPaintProperty('fires-fill', 'fill-opacity', ['case',
-      ['boolean', ['feature-state', 'hover'], false],
-      Math.min(opacityVal + 0.15, 1.0),
-      opacityVal * 0.75
-    ]);
+
+  const opacityExpr = ['case',
+    ['any', ['boolean', ['feature-state', 'hover'], false], ['boolean', ['feature-state', 'popup'], false]],
+    Math.min(opacityVal + 0.35, 1.0),
+    opacityVal * 0.75
+  ];
+
+  if (map.getLayer('fires-fill-lowres')) {
+    map.setPaintProperty('fires-fill-lowres', 'fill-opacity', opacityExpr);
   }
+  if (map.getLayer('fires-fill')) {
+    map.setPaintProperty('fires-fill', 'fill-opacity', opacityExpr);
+  }
+});
+
+document.getElementById('opacity-slider').addEventListener('change', () => {
+  saveSettings();
+});
+
+document.getElementById('opacity-row').addEventListener('wheel', e => {
+  e.preventDefault();
+  const delta = e.deltaY > 0 ? -5 : 5;
+  const slider = document.getElementById('opacity-slider');
+  slider.value = Math.min(100, Math.max(0, parseInt(slider.value) + delta));
+  slider.dispatchEvent(new Event('input'));
 });
 
 document.getElementById('units-select').addEventListener('change', e => {
@@ -872,35 +1283,221 @@ document.getElementById('theme-select').addEventListener('change', e => {
   saveSettings();
 });
 
-document.getElementById('hillshade-check').addEventListener('change', e => {
-  setupTerrain(e.target.checked, terrainExaggeration);
+document.getElementById('terrain-select').addEventListener('change', e => {
+  setupTerrain(e.target.value, terrainExaggeration);
   saveSettings();
 });
 
 document.getElementById('terrain-exaggeration').addEventListener('input', e => {
   const val = parseFloat(e.target.value);
   if (!isNaN(val)) {
-    setupTerrain(terrainEnabled, val);
+    setupTerrain(terrainMode, val);
     saveSettings();
   }
 });
 
-// ---- Settings dropdown ----
+// ---- Settings and Search dropdowns ----
 document.addEventListener('click', e => {
-  const menu = document.getElementById('settings-menu');
-  const btn = document.getElementById('settings-btn');
-  if (!btn.contains(e.target) && !menu.contains(e.target)) {
-    menu.style.display = 'none';
+  const searchResults = document.getElementById('search-results');
+  const searchInput = document.getElementById('location-search');
+  if (searchResults && searchInput && !searchInput.contains(e.target) && !searchResults.contains(e.target)) {
+    searchResults.style.display = 'none';
   }
 });
 
-window.toggleSettings = function (e) {
+window.toggleSettings = (e) => {
   e.stopPropagation();
-  const menu = document.getElementById('settings-menu');
-  const isShown = menu.style.display === 'flex';
-  menu.style.display = isShown ? 'none' : 'flex';
-  menu.style.flexDirection = 'column';
-  menu.style.gap = '10px';
+  document.getElementById('settings-menu').classList.toggle('show');
 };
+
+window.addEventListener('click', () => {
+  const menu = document.getElementById('settings-menu');
+  if (menu) menu.classList.remove('show');
+});
+
+document.getElementById('settings-menu').addEventListener('click', (e) => e.stopPropagation());
+
+// ---- Search Feature ----
+function getGeometryCenter(geometry) {
+  if (!geometry) return null;
+  let coords = [];
+  if (geometry.type === 'Point') {
+    coords = [geometry.coordinates];
+  } else if (geometry.type === 'MultiPoint' || geometry.type === 'LineString') {
+    coords = geometry.coordinates;
+  } else if (geometry.type === 'MultiLineString' || geometry.type === 'Polygon') {
+    coords = geometry.coordinates.flat(1);
+  } else if (geometry.type === 'MultiPolygon') {
+    coords = geometry.coordinates.flat(2);
+  }
+  if (coords.length === 0) return null;
+
+  let minLng = Infinity, maxLng = -Infinity, minLat = Infinity, maxLat = -Infinity;
+  for (const c of coords) {
+    if (Array.isArray(c) && c.length >= 2) {
+      const lng = c[0], lat = c[1];
+      if (lng < minLng) minLng = lng;
+      if (lng > maxLng) maxLng = lng;
+      if (lat < minLat) minLat = lat;
+      if (lat > maxLat) maxLat = lat;
+    }
+  }
+  return {
+    lng: (minLng + maxLng) / 2,
+    lat: (minLat + maxLat) / 2,
+    bounds: [[minLng, minLat], [maxLng, maxLat]]
+  };
+}
+
+function searchFires(query) {
+  const matches = [];
+  const lowerQuery = query.toLowerCase();
+  for (const f of allFeatures) {
+    if (f.properties && f.properties.n) {
+      if (f.properties.n.toLowerCase().includes(lowerQuery)) {
+        matches.push(f);
+      }
+    }
+  }
+  // Sort by acres descending
+  matches.sort((a, b) => (b.properties.ac || 0) - (a.properties.ac || 0));
+  return matches.slice(0, 5);
+}
+
+function searchPlaces(query, callback) {
+  fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(query)}&limit=5`)
+    .then(r => r.json())
+    .then(data => callback(data))
+    .catch(err => {
+      console.error('Place search failed:', err);
+      callback([]);
+    });
+}
+
+function renderSearchResults(fires, places) {
+  const searchResults = document.getElementById('search-results');
+  const searchInput = document.getElementById('location-search');
+  let html = '';
+
+  if (fires.length > 0) {
+    html += `<div class="search-results-section-header">Fires</div>`;
+    fires.forEach((f, idx) => {
+      const name = f.properties.n || 'Unnamed';
+      const year = f.properties.y || '';
+      const acresVal = f.properties.ac || 0;
+      
+      const valueText = formatAcresValue(acresVal);
+      const unit = UNIT_LABEL[currentUnits] || 'acres';
+
+      const yearColor = interpolateColor(YEAR_COLOR_STOPS, year);
+      const sizeColor = interpolateColor(SIZE_COLOR_STOPS, acresVal);
+
+      const yearSpan = year ? `<span style="color:${yearColor}; font-weight:600;">${year}</span>` : '';
+      const sizeSpan = acresVal ? `<span style="color:${sizeColor}; font-weight:600;">${valueText}</span> <span style="color:var(--text-dim);">${unit}</span>` : '';
+      const separator = (year && acresVal) ? ` <span style="color:var(--text-dim);">·</span> ` : '';
+      const desc = `${yearSpan}${separator}${sizeSpan}`;
+
+      html += `
+        <div class="search-result-item" data-type="fire" data-index="${idx}">
+          <strong>${escHtml(name)} Fire</strong>
+          <span style="font-size:10px;">${desc}</span>
+        </div>
+      `;
+    });
+  }
+
+  if (places.length > 0) {
+    html += `<div class="search-results-section-header">Places</div>`;
+    places.forEach((p, idx) => {
+      html += `
+        <div class="search-result-item" data-type="place" data-lat="${p.lat}" data-lon="${p.lon}">
+          <span>${escHtml(p.display_name)}</span>
+        </div>
+      `;
+    });
+  }
+
+  if (fires.length === 0 && places.length === 0) {
+    html = `<div style="padding: 10px 12px; font-size:12px; color:var(--text-dim);">No results found</div>`;
+  }
+
+  searchResults.innerHTML = html;
+  searchResults.style.display = 'flex';
+
+  const items = searchResults.querySelectorAll('.search-result-item');
+  items.forEach(item => {
+    item.addEventListener('click', () => {
+      const type = item.getAttribute('data-type');
+      if (type === 'fire') {
+        const idx = parseInt(item.getAttribute('data-index'));
+        const feat = fires[idx];
+        const center = getGeometryCenter(feat.geometry);
+        if (center) {
+          if (center.bounds) {
+            map.fitBounds(center.bounds, { padding: 40, maxZoom: 14 });
+          } else {
+            map.flyTo({ center: [center.lng, center.lat], zoom: 12 });
+          }
+
+          clickFeatures = [feat];
+          clickIndex = 0;
+          currentPopupLngLat = new maplibregl.LngLat(center.lng, center.lat);
+          currentCounty = '';
+          renderFirePopup();
+
+          fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${center.lat}&lon=${center.lng}&zoom=10`)
+            .then(r => r.json())
+            .then(data => {
+              if (data && data.address && data.address.county) {
+                currentCounty = data.address.county;
+                if (currentPopup && currentPopup.isOpen()) renderFirePopup();
+              }
+            })
+            .catch(() => { });
+        }
+      } else if (type === 'place') {
+        const lat = parseFloat(item.getAttribute('data-lat'));
+        const lon = parseFloat(item.getAttribute('data-lon'));
+        map.flyTo({ center: [lon, lat], zoom: 10 });
+      }
+
+      searchResults.style.display = 'none';
+      searchInput.value = '';
+    });
+  });
+}
+
+let searchTimeout = null;
+const searchInput = document.getElementById('location-search');
+const searchResults = document.getElementById('search-results');
+
+if (searchInput) {
+  searchInput.addEventListener('input', e => {
+    clearTimeout(searchTimeout);
+    const q = e.target.value.trim();
+    if (q.length < 2) {
+      searchResults.innerHTML = '';
+      searchResults.style.display = 'none';
+      return;
+    }
+
+    searchTimeout = setTimeout(() => {
+      const matchedFires = searchFires(q);
+      searchPlaces(q, (matchedPlaces) => {
+        renderSearchResults(matchedFires, matchedPlaces);
+      });
+    }, 350);
+  });
+
+  searchInput.addEventListener('keydown', e => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      const firstResult = searchResults.querySelector('.search-result-item');
+      if (firstResult) {
+        firstResult.click();
+      }
+    }
+  });
+}
 
 

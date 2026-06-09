@@ -2,3 +2,4 @@ gis_env/
 node_modules/
 *.pyc
 __pycache__/
+*.gdb/
