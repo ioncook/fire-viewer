@@ -11,6 +11,22 @@ GDB_PATH = "firedata.gdb"
 LAYER = "InteragencyFirePerimeterHistory"
 OUTPUT_DIR = "docs"
 
+def round_coordinates(geom_dict, precision=5):
+    if not geom_dict:
+        return geom_dict
+    
+    def round_coords(coords):
+        if isinstance(coords, (list, tuple)):
+            if len(coords) > 0 and isinstance(coords[0], (int, float)):
+                return [round(float(c), precision) for c in coords]
+            else:
+                return [round_coords(c) for c in coords]
+        return coords
+
+    if 'coordinates' in geom_dict:
+        geom_dict['coordinates'] = round_coords(geom_dict['coordinates'])
+    return geom_dict
+
 STATES = {
     'CA': 'California',
     'OR': 'Oregon',
@@ -59,8 +75,11 @@ def main():
         print(f"Error downloading states geojson: {e}")
 
     columns = ['FIRE_YEAR_INT', 'INCIDENT', 'AGENCY', 'GIS_ACRES', 'UNIT_ID', 'DATE_CUR', 'geometry']
-    merged_high = []
     merged_low = []
+    merged_mid = []
+    merged_high = []
+    fire_id_map = {}
+    next_fire_id = 1
     
     print("Reading and simplifying state-by-state perimeters...")
     for code, name in STATES.items():
@@ -100,6 +119,20 @@ def main():
                 if geom is None or geom.is_empty:
                     continue
                 
+                alarm_str = row['alarm_str']
+                se = 4 # Default to Winter (4)
+                if alarm_str and len(alarm_str) >= 7:
+                    try:
+                        m = int(alarm_str[5:7])
+                        if 3 <= m <= 5:
+                            se = 1      # Spring
+                        elif 6 <= m <= 8:
+                            se = 2      # Summer
+                        elif 9 <= m <= 11:
+                            se = 3      # Fall
+                    except:
+                        pass
+
                 props = {
                     "y": int(row['FIRE_YEAR_INT']),
                     "n": row['INCIDENT'] or 'Unnamed',
@@ -107,34 +140,61 @@ def main():
                     "ac": round(float(row['GIS_ACRES']), 1),
                     "c": 14,
                     "cl": "Unknown",
-                    "ad": row['alarm_str'],
+                    "ad": alarm_str,
                     "cd": "",
-                    "st": code  # State code
+                    "st": code,  # State code
+                    "se": se
                 }
+
+                # Stable unique integer ID based on (year, name, state)
+                key = (props['y'], props['n'].lower(), props['st'])
+                if key not in fire_id_map:
+                    fire_id_map[key] = next_fire_id
+                    next_fire_id += 1
+                fire_id = fire_id_map[key]
                 
                 try:
-                    # Calculate bbox
-                    bbox = list(geom.bounds) if geom else None
+                    # Calculate bbox rounded to 5 decimals
+                    bbox = [round(x, 5) for x in geom.bounds] if geom else None
 
-                    # High resolution (0.0003 degrees ~30m detail)
+                    # 1. Low resolution (0.008 degrees ~880m detail)
+                    geom_low = geom.simplify(0.008, preserve_topology=True)
+                    if geom_low and not geom_low.is_empty:
+                        geom_low = geom_low.buffer(0)
+                        if geom_low and not geom_low.is_empty:
+                            merged_low.append({
+                                "type": "Feature",
+                                "id": fire_id,
+                                "properties": props.copy(),
+                                "geometry": round_coordinates(mapping(geom_low), 5),
+                                "bbox": bbox
+                            })
+
+                    # 2. Mid resolution (0.002 degrees ~220m detail)
+                    geom_mid = geom.simplify(0.002, preserve_topology=True)
+                    if geom_mid and not geom_mid.is_empty:
+                        geom_mid = geom_mid.buffer(0)
+                        if geom_mid and not geom_mid.is_empty:
+                            merged_mid.append({
+                                "type": "Feature",
+                                "id": fire_id,
+                                "properties": props.copy(),
+                                "geometry": round_coordinates(mapping(geom_mid), 5),
+                                "bbox": bbox
+                            })
+
+                    # 3. High resolution (0.0003 degrees ~30m detail)
                     geom_high = geom.simplify(0.0003, preserve_topology=True)
                     if geom_high and not geom_high.is_empty:
-                        merged_high.append({
-                            "type": "Feature",
-                            "properties": props.copy(),
-                            "geometry": mapping(geom_high),
-                            "bbox": bbox
-                        })
-                    
-                    # Low resolution (0.006 degrees ~660m detail)
-                    geom_low = geom.simplify(0.006, preserve_topology=True)
-                    if geom_low and not geom_low.is_empty:
-                        merged_low.append({
-                            "type": "Feature",
-                            "properties": props.copy(),
-                            "geometry": mapping(geom_low),
-                            "bbox": bbox
-                        })
+                        geom_high = geom_high.buffer(0)
+                        if geom_high and not geom_high.is_empty:
+                            merged_high.append({
+                                "type": "Feature",
+                                "id": fire_id,
+                                "properties": props.copy(),
+                                "geometry": round_coordinates(mapping(geom_high), 5),
+                                "bbox": bbox
+                            })
                     state_count += 1
                 except:
                     pass
@@ -162,33 +222,42 @@ def main():
                     existing['properties']['ad'] = earliest_date
         return list(deduped.values())
 
-    print("Deduplicating and writing high-resolution state perimeters...")
-    states_dir = os.path.join(OUTPUT_DIR, "states")
-    os.makedirs(states_dir, exist_ok=True)
-    # Group by state code and write
-    for code in STATES.keys():
-        state_high_features = [f for f in merged_high if f['properties']['st'] == code]
-        if len(state_high_features) > 0:
-            print(f"  Deduplicating high-res perimeters for {code}...")
-            deduped_state = deduplicate(state_high_features)
-            out_path_high = os.path.join(states_dir, f"fires_{code}.geojson")
-            print(f"  Writing high-res perimeters to {out_path_high}...")
-            with open(out_path_high, 'w') as f:
-                json.dump({"type": "FeatureCollection", "features": deduped_state}, f, separators=(',', ':'))
-            size_mb = os.path.getsize(out_path_high) / (1024 * 1024)
-            print(f"  Created: {size_mb:.2f} MB")
-
-    print("Deduplicating and writing low-resolution perimeters...")
+    print("Deduplicating low-resolution perimeters...")
     low_features = deduplicate(merged_low)
-    print(f"  Low-res reduced to {len(low_features)} unique perimeters.")
-
-    # Write the combined low-res GeoJSON file
     out_path_low = os.path.join(OUTPUT_DIR, "fires_lowres.geojson")
     print(f"Writing low-res perimeters to {out_path_low}...")
     with open(out_path_low, 'w') as f:
         json.dump({"type": "FeatureCollection", "features": low_features}, f, separators=(',', ':'))
     size_mb_low = os.path.getsize(out_path_low) / (1024 * 1024)
-    print(f"Low-res created: {size_mb_low:.2f} MB")
+    print(f"Low-res created: {size_mb_low:.2f} MB ({len(low_features)} features)")
+
+    # Write state-by-state mid-res and high-res polygons
+    states_dir = os.path.join(OUTPUT_DIR, "states")
+    os.makedirs(states_dir, exist_ok=True)
+    for code in STATES.keys():
+        # Mid-res
+        state_mid = [f for f in merged_mid if f['properties']['st'] == code]
+        if len(state_mid) > 0:
+            print(f"  Deduplicating mid-res perimeters for {code}...")
+            deduped_mid = deduplicate(state_mid)
+            out_path_mid = os.path.join(states_dir, f"fires_midres_{code}.geojson")
+            print(f"  Writing mid-res perimeters to {out_path_mid}...")
+            with open(out_path_mid, 'w') as f:
+                json.dump({"type": "FeatureCollection", "features": deduped_mid}, f, separators=(',', ':'))
+            size_mb = os.path.getsize(out_path_mid) / (1024 * 1024)
+            print(f"  Created Midres: {size_mb:.2f} MB")
+
+        # High-res
+        state_high = [f for f in merged_high if f['properties']['st'] == code]
+        if len(state_high) > 0:
+            print(f"  Deduplicating high-res perimeters for {code}...")
+            deduped_high = deduplicate(state_high)
+            out_path_high = os.path.join(states_dir, f"fires_highres_{code}.geojson")
+            print(f"  Writing high-res perimeters to {out_path_high}...")
+            with open(out_path_high, 'w') as f:
+                json.dump({"type": "FeatureCollection", "features": deduped_high}, f, separators=(',', ':'))
+            size_mb = os.path.getsize(out_path_high) / (1024 * 1024)
+            print(f"  Created Highres: {size_mb:.2f} MB")
 
 if __name__ == "__main__":
     main()

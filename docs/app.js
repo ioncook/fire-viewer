@@ -3,7 +3,11 @@ maplibregl.prewarm();
 maplibregl.workerCount = Math.max(2, navigator.hardwareConcurrency || 2);
 
 // ---- Global State ----
-let allFeatures = [];       // raw GeoJSON features (contains fires.geojson)
+let allFeatures = [];       // raw GeoJSON features (contains fires_lowres.geojson at startup)
+let loadedMidres = [];      // mid-res perimeters loaded state-by-state
+let loadedHighres = [];     // high-res perimeters loaded state-by-state
+let loadedMidStates = {};   // tracker for midres loading states
+let loadedHighStates = {};  // tracker for highres loading states
 let currentPopup = null;
 let currentBasemap = 'dark';
 let colorMode = 'decade';
@@ -14,9 +18,7 @@ let filteredCount = 0;
 let filteredAcres = 0;
 let filteredLargest = '';
 let dataLoaded = false;
-let highResLoaded = false;
 let loadedStates = {};
-let highResFeatures = [];
 let terrainMode = 'off';
 let terrainExaggeration = 1.5;
 let currentProjection = 'mercator'; // 'mercator' | 'globe'
@@ -219,42 +221,200 @@ function loadHash() {
 }
 loadHash();
 
-function loadStateHighRes(code) {
-  if (loadedStates[code]) return;
-  loadedStates[code] = 'loading';
+/// ---- Background Web Worker for Fetching and Parsing GeoJSON ----
+const workerCode = `
+  const cache = {};
+  const loading = {};
 
-  const statusEl = document.getElementById('status');
-  if (statusEl) statusEl.textContent = `Loading details for ${code}…`;
+  function intersects(featBbox, viewportBbox) {
+    if (!featBbox) return true;
+    return !(featBbox[2] < viewportBbox[0] || 
+             featBbox[0] > viewportBbox[2] || 
+             featBbox[3] < viewportBbox[1] || 
+             featBbox[1] > viewportBbox[3]);
+  }
 
-  fetch(`./states/fires_${code}.geojson`)
-    .then(r => {
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      return r.json();
-    })
-    .then(geojson => {
-      const features = geojson.features || [];
-      processFeatures(features);
+  self.onmessage = function(e) {
+    const data = e.data;
+    
+    if (data.type === 'FETCH') {
+      const { url, code } = data;
+      fetch(url)
+        .then(r => {
+          if (!r.ok) throw new Error("HTTP " + r.status);
+          return r.json();
+        })
+        .then(geojson => {
+          cache[code] = geojson.features || [];
+          self.postMessage({ type: 'FETCH_SUCCESS', code, geojson });
+        })
+        .catch(err => {
+          self.postMessage({ type: 'FETCH_ERROR', code, error: err.message });
+        });
+    }
+    
+    else if (data.type === 'QUERY_VIEWPORT') {
+      const { zoom, bounds, visibleStates, baseUrl } = data;
+      
+      const filteredMid = [];
+      const filteredHigh = [];
+      
+      const midStatesStatus = {};
+      const highStatesStatus = {};
 
-      // Merge new high-res features
-      highResFeatures = highResFeatures.concat(features);
-      loadedStates[code] = 'loaded';
+      visibleStates.forEach(code => {
+        // Handle Mid-Res (7.0 <= zoom < 10.0)
+        if (zoom >= 7.0 && zoom < 10.0) {
+          const cacheKey = 'midres_' + code;
+          if (cache[cacheKey]) {
+            midStatesStatus[code] = 'loaded';
+            const features = cache[cacheKey];
+            for (let i = 0; i < features.length; i++) {
+              const f = features[i];
+              if (intersects(f.bbox, bounds)) {
+                filteredMid.push(f);
+              }
+            }
+          } else if (!loading[cacheKey]) {
+            loading[cacheKey] = true;
+            midStatesStatus[code] = 'loading';
+            const url = baseUrl + 'states/fires_midres_' + code + '.geojson';
+            fetch(url)
+              .then(r => r.json())
+              .then(geojson => {
+                cache[cacheKey] = geojson.features || [];
+                loading[cacheKey] = false;
+                self.postMessage({ type: 'STATE_LOADED', resolution: 'midres', code });
+              })
+              .catch(err => {
+                loading[cacheKey] = false;
+                self.postMessage({ type: 'LOAD_ERROR', resolution: 'midres', code, error: err.message });
+              });
+          } else {
+            midStatesStatus[code] = 'loading';
+          }
+        }
+        
+        // Handle High-Res (zoom >= 10.0)
+        if (zoom >= 10.0) {
+          const cacheKey = 'highres_' + code;
+          if (cache[cacheKey]) {
+            highStatesStatus[code] = 'loaded';
+            const features = cache[cacheKey];
+            for (let i = 0; i < features.length; i++) {
+              const f = features[i];
+              if (intersects(f.bbox, bounds)) {
+                filteredHigh.push(f);
+              }
+            }
+          } else if (!loading[cacheKey]) {
+            loading[cacheKey] = true;
+            highStatesStatus[code] = 'loading';
+            const url = baseUrl + 'states/fires_highres_' + code + '.geojson';
+            fetch(url)
+              .then(r => r.json())
+              .then(geojson => {
+                cache[cacheKey] = geojson.features || [];
+                loading[cacheKey] = false;
+                self.postMessage({ type: 'STATE_LOADED', resolution: 'highres', code });
+              })
+              .catch(err => {
+                loading[cacheKey] = false;
+                self.postMessage({ type: 'LOAD_ERROR', resolution: 'highres', code, error: err.message });
+              });
+          } else {
+            highStatesStatus[code] = 'loading';
+          }
+        }
+      });
 
-      // Replace low-res features in allFeatures
-      allFeatures = allFeatures.filter(f => !(f.properties && f.properties.st === code));
-      allFeatures = allFeatures.concat(features);
+      self.postMessage({
+        type: 'QUERY_RESULT',
+        midFeatures: filteredMid,
+        highFeatures: filteredHigh,
+        midStatesStatus,
+        highStatesStatus
+      });
+    }
+  };
+`;
 
-      const loadedList = Object.keys(loadedStates).filter(k => loadedStates[k] === 'loaded').join(', ');
-      if (statusEl) {
-        statusEl.textContent = `Loaded detail for ${loadedList}`;
+const blob = new Blob([workerCode], { type: 'application/javascript' });
+const geojsonWorker = new Worker(URL.createObjectURL(blob));
+const pendingCallbacks = {};
+
+geojsonWorker.onmessage = function(e) {
+  const data = e.data;
+  
+  if (data.type === 'FETCH_SUCCESS') {
+    const cb = pendingCallbacks[data.code];
+    if (cb) {
+      delete pendingCallbacks[data.code];
+      cb(null, data.geojson);
+    }
+  } else if (data.type === 'FETCH_ERROR') {
+    const cb = pendingCallbacks[data.code];
+    if (cb) {
+      delete pendingCallbacks[data.code];
+      cb(new Error(data.error));
+    }
+  } else if (data.type === 'STATE_LOADED') {
+    // Re-query viewport features now that the state dataset is parsed and cached in worker
+    updateViewportData();
+  } else if (data.type === 'LOAD_ERROR') {
+    console.error(`Failed to load ${data.resolution} for ${data.code}:`, data.error);
+    if (data.resolution === 'midres') {
+      loadedMidStates[data.code] = null;
+    } else {
+      loadedHighStates[data.code] = null;
+    }
+  } else if (data.type === 'QUERY_RESULT') {
+    loadedMidres = data.midFeatures;
+    loadedHighres = data.highFeatures;
+    
+    // Update loading statuses
+    for (const [code, status] of Object.entries(data.midStatesStatus)) {
+      loadedMidStates[code] = status;
+    }
+    for (const [code, status] of Object.entries(data.highStatesStatus)) {
+      loadedHighStates[code] = status;
+    }
+
+    const sourceMid = map.getSource('fires-midres-source');
+    if (sourceMid) {
+      sourceMid.setData({
+        type: 'FeatureCollection',
+        features: loadedMidres
+      });
+    }
+
+    const sourceHigh = map.getSource('fires-source');
+    if (sourceHigh) {
+      sourceHigh.setData({
+        type: 'FeatureCollection',
+        features: loadedHighres
+      });
+    }
+
+    const midLoadedList = Object.keys(loadedMidStates).filter(k => loadedMidStates[k] === 'loaded').join(', ');
+    const highLoadedList = Object.keys(loadedHighStates).filter(k => loadedHighStates[k] === 'loaded').join(', ');
+    const statusEl = document.getElementById('status');
+    if (statusEl) {
+      if (map.getZoom() >= 10.0) {
+        statusEl.textContent = `Loaded closeup detail for: ${highLoadedList || 'None'}`;
+      } else if (map.getZoom() >= 7.0) {
+        statusEl.textContent = `Loaded mid-res detail for: ${midLoadedList || 'None'}`;
       }
+    }
 
-      updateViewportData();
-      updateStats();
-    })
-    .catch(err => {
-      console.error(`Failed to load high-res perimeters for ${code}:`, err);
-      loadedStates[code] = null; // allow retry
-    });
+    applyFireLayers();
+  }
+};
+
+function fetchGeoJSONWithWorker(url, code, callback) {
+  pendingCallbacks[code] = callback;
+  const absoluteUrl = new URL(url, window.location.href).href;
+  geojsonWorker.postMessage({ type: 'FETCH', url: absoluteUrl, code });
 }
 
 function updateViewportData() {
@@ -262,31 +422,74 @@ function updateViewportData() {
 
   const zoom = map.getZoom();
 
-  // If zoomed out, clear high-res source to free memory and CPU
-  if (zoom < 6.5) {
-    const source = map.getSource('fires-source');
-    if (source) {
-      source.setData({ type: 'FeatureCollection', features: [] });
+  // If zoomed out completely, clear both mid-res and high-res sources to free CPU and memory
+  if (zoom < 7.0) {
+    let changed = false;
+    if (loadedMidres.length > 0 || Object.keys(loadedMidStates).length > 0) {
+      loadedMidres = [];
+      loadedMidStates = {};
+      const source = map.getSource('fires-midres-source');
+      if (source) source.setData({ type: 'FeatureCollection', features: [] });
+      changed = true;
+    }
+    if (loadedHighres.length > 0 || Object.keys(loadedHighStates).length > 0) {
+      loadedHighres = [];
+      loadedHighStates = {};
+      const source = map.getSource('fires-source');
+      if (source) source.setData({ type: 'FeatureCollection', features: [] });
+      changed = true;
+    }
+    if (changed) {
+      applyFireLayers();
     }
     return;
   }
 
-  const bounds = map.getBounds();
-  const west = bounds.getWest();
-  const east = bounds.getEast();
-  const south = bounds.getSouth();
-  const north = bounds.getNorth();
+  let west, east, south, north;
+  try {
+    const canvas = map.getCanvas();
+    const w_width = canvas.clientWidth;
+    const w_height = canvas.clientHeight;
+    
+    const tl = map.unproject([0, 0]);
+    const tr = map.unproject([w_width, 0]);
+    const bl = map.unproject([0, w_height]);
+    const br = map.unproject([w_width, w_height]);
 
-  // Add 10% padding buffer around viewport to avoid edge clipping / pop-in during small pans
-  const padLng = (east - west) * 0.1;
-  const padLat = (north - south) * 0.1;
-
+    const coords = [tl, tr, bl, br].filter(c => c && !isNaN(c.lng) && !isNaN(c.lat));
+    
+    if (coords.length > 0) {
+      const lats = coords.map(c => c.lat);
+      const lngs = coords.map(c => c.lng);
+      west = Math.min(...lngs);
+      east = Math.max(...lngs);
+      south = Math.min(...lats);
+      north = Math.max(...lats);
+    } else {
+      const bounds = map.getBounds();
+      west = bounds.getWest();
+      east = bounds.getEast();
+      south = bounds.getSouth();
+      north = bounds.getNorth();
+    }
+  } catch (err) {
+    const bounds = map.getBounds();
+    west = bounds.getWest();
+    east = bounds.getEast();
+    south = bounds.getSouth();
+    north = bounds.getNorth();
+  }
+  
+  // Viewport padding (15%) to preload slightly ahead of active panning
+  const padLng = (east - west) * 0.15;
+  const padLat = (north - south) * 0.15;
   const w = west - padLng;
   const e = east + padLng;
   const s = south - padLat;
   const n = north + padLat;
 
-  // Identify visible states and trigger background load
+  // Identify visible states
+  const visibleStates = [];
   for (const [code, stBounds] of Object.entries(STATE_BOUNDS)) {
     const stMinLng = stBounds[0][0];
     const stMinLat = stBounds[0][1];
@@ -294,48 +497,74 @@ function updateViewportData() {
     const stMaxLat = stBounds[1][1];
 
     if (stMaxLng >= w && stMinLng <= e && stMaxLat >= s && stMinLat <= n) {
-      if (!loadedStates[code]) {
-        loadStateHighRes(code);
-      }
+      visibleStates.push(code);
     }
   }
 
-  // Filter whatever features are in allFeatures (handles both loaded high-res and fallback low-res)
-  const filtered = [];
-  for (let i = 0; i < allFeatures.length; i++) {
-    const feat = allFeatures[i];
-    if (feat.bbox) {
-      const [fW, fS, fE, fN] = feat.bbox;
-      if (fE >= w && fW <= e && fN >= s && fS <= n) {
-        filtered.push(feat);
-      }
-    } else {
-      filtered.push(feat);
-    }
-  }
+  const baseUrl = new URL('./', window.location.href).href;
 
-  const source = map.getSource('fires-source');
-  if (source) {
-    source.setData({
-      type: 'FeatureCollection',
-      features: filtered
-    });
+  // Query background worker
+  geojsonWorker.postMessage({
+    type: 'QUERY_VIEWPORT',
+    zoom,
+    bounds: [w, s, e, n],
+    visibleStates,
+    baseUrl
+  });
+}
+
+// Throttle updates during active zooming and panning to query background worker 5 times a second
+let throttleTimeout = null;
+let lastThrottleTime = 0;
+
+function throttledUpdateViewportData() {
+  const now = Date.now();
+  const elapsed = now - lastThrottleTime;
+  
+  if (elapsed >= 200) { // 200ms throttle interval (5 times a second)
+    clearTimeout(throttleTimeout);
+    throttleTimeout = null;
+    lastThrottleTime = now;
+    updateViewportData();
+  } else if (!throttleTimeout) {
+    throttleTimeout = setTimeout(() => {
+      lastThrottleTime = Date.now();
+      throttleTimeout = null;
+      updateViewportData();
+    }, 200 - elapsed);
   }
 }
 
 let lastZoom = map.getZoom();
 map.on('zoom', () => {
   const zoom = map.getZoom();
-  // Only trigger updates immediately when crossing the visibility threshold
-  if ((zoom >= 6.5 && lastZoom < 6.5) || (zoom < 6.5 && lastZoom >= 6.5)) {
+  // Trigger updates immediately when crossing the visibility thresholds (7.0 and 10.0)
+  const crossedMid = (zoom >= 7.0 && lastZoom < 7.0) || (zoom < 7.0 && lastZoom >= 7.0);
+  const crossedHigh = (zoom >= 10.0 && lastZoom < 10.0) || (zoom < 10.0 && lastZoom >= 10.0);
+  if (crossedMid || crossedHigh) {
     updateViewportData();
+  } else {
+    throttledUpdateViewportData();
   }
   lastZoom = zoom;
 });
 
+map.on('move', throttledUpdateViewportData);
+
 map.on('moveend', () => {
   updateHash();
-  updateViewportData();
+  throttledUpdateViewportData();
+});
+
+// Re-apply highlight state whenever data is updated or loaded
+map.on('sourcedata', (e) => {
+  if (e.isSourceLoaded) {
+    if (popupActiveId !== null && (e.sourceId === 'fires-source' || e.sourceId === 'fires-midres-source' || e.sourceId === 'fires-lowres-source')) {
+      try {
+        map.setFeatureState({ source: e.sourceId, id: popupActiveId }, { popup: true });
+      } catch (err) {}
+    }
+  }
 });
 
 map.addControl(new maplibregl.NavigationControl({ showCompass: false }), 'bottom-right');
@@ -478,7 +707,7 @@ function updateStats() {
 }
 
 // ---- Build MapLibre filter expression ----
-function buildMapFilter() {
+function buildMapFilter(isLow = false, isMid = false) {
   const filter = [
     'all',
     ['>=', ['get', 'y'], activeFilters.yearMin],
@@ -487,6 +716,23 @@ function buildMapFilter() {
   ];
   if (activeFilters.cause !== 'all') {
     filter.push(['==', ['to-string', ['get', 'c']], activeFilters.cause]);
+  }
+  
+  const zoom = map.getZoom();
+  if (isLow) {
+    if (zoom >= 7.0) {
+      const loadedMidCodes = Object.keys(loadedMidStates).filter(k => loadedMidStates[k] === 'loaded');
+      loadedMidCodes.forEach(code => {
+        filter.push(['!=', ['get', 'st'], code]);
+      });
+    }
+  } else if (isMid) {
+    if (zoom >= 10.0) {
+      const loadedHighCodes = Object.keys(loadedHighStates).filter(k => loadedHighStates[k] === 'loaded');
+      loadedHighCodes.forEach(code => {
+        filter.push(['!=', ['get', 'st'], code]);
+      });
+    }
   }
   return filter;
 }
@@ -526,12 +772,14 @@ function buildColorExpression() {
 function applyFireLayers() {
   updateStats();
   const colorExpr = buildColorExpression();
-  const filterExpr = buildMapFilter();
+  const filterExprLow = buildMapFilter(true, false);
+  const filterExprMid = buildMapFilter(false, true);
+  const filterExprHigh = buildMapFilter(false, false);
 
   // Apply to low-res layers if present
   if (map.getSource('fires-lowres-source')) {
     if (map.getLayer('fires-fill-lowres')) {
-      map.setFilter('fires-fill-lowres', filterExpr);
+      map.setFilter('fires-fill-lowres', filterExprLow);
       map.setPaintProperty('fires-fill-lowres', 'fill-color', colorExpr);
       map.setPaintProperty('fires-fill-lowres', 'fill-opacity', ['case',
         ['any', ['boolean', ['feature-state', 'hover'], false], ['boolean', ['feature-state', 'popup'], false]],
@@ -540,15 +788,32 @@ function applyFireLayers() {
       ]);
     }
     if (map.getLayer('fires-outline-lowres')) {
-      map.setFilter('fires-outline-lowres', filterExpr);
+      map.setFilter('fires-outline-lowres', filterExprLow);
       map.setPaintProperty('fires-outline-lowres', 'line-color', colorExpr);
+    }
+  }
+
+  // Apply to mid-res layers if present
+  if (map.getSource('fires-midres-source')) {
+    if (map.getLayer('fires-fill-midres')) {
+      map.setFilter('fires-fill-midres', filterExprMid);
+      map.setPaintProperty('fires-fill-midres', 'fill-color', colorExpr);
+      map.setPaintProperty('fires-fill-midres', 'fill-opacity', ['case',
+        ['any', ['boolean', ['feature-state', 'hover'], false], ['boolean', ['feature-state', 'popup'], false]],
+        Math.min(opacityVal + 0.35, 1.0),
+        opacityVal * 0.75
+      ]);
+    }
+    if (map.getLayer('fires-outline-midres')) {
+      map.setFilter('fires-outline-midres', filterExprMid);
+      map.setPaintProperty('fires-outline-midres', 'line-color', colorExpr);
     }
   }
 
   // Apply to high-res layers if present
   if (map.getSource('fires-source')) {
     if (map.getLayer('fires-fill')) {
-      map.setFilter('fires-fill', filterExpr);
+      map.setFilter('fires-fill', filterExprHigh);
       map.setPaintProperty('fires-fill', 'fill-color', colorExpr);
       map.setPaintProperty('fires-fill', 'fill-opacity', ['case',
         ['any', ['boolean', ['feature-state', 'hover'], false], ['boolean', ['feature-state', 'popup'], false]],
@@ -557,10 +822,18 @@ function applyFireLayers() {
       ]);
     }
     if (map.getLayer('fires-outline')) {
-      map.setFilter('fires-outline', filterExpr);
+      map.setFilter('fires-outline', filterExprHigh);
       map.setPaintProperty('fires-outline', 'line-color', colorExpr);
     }
-    updateViewportData();
+  }
+
+  // Restore selected fire highlight immediately after updating filters/sources
+  if (popupActiveId !== null) {
+    try {
+      map.setFeatureState({ source: 'fires-lowres-source', id: popupActiveId }, { popup: true });
+      map.setFeatureState({ source: 'fires-midres-source', id: popupActiveId }, { popup: true });
+      map.setFeatureState({ source: 'fires-source', id: popupActiveId }, { popup: true });
+    } catch (err) {}
   }
 
   if (map.getLayer('hillshade-layer') && map.getLayoutProperty('hillshade-layer', 'visibility') !== 'none') {
@@ -688,7 +961,7 @@ function buildFirePopupHTML() {
     </div>` : '';
 
   return `
-    <div style="border-left:3px solid ${featureColor}; margin:-6px -10px -10px -11px; padding:6px 14px 12px 11px;">
+    <div class="popup-inner" style="border-left: 3px solid ${featureColor};">
       <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:3px;">
         <div class="popup-title" style="margin-bottom:0;">${escHtml(name)} Fire</div>
         ${navHtml}
@@ -722,19 +995,19 @@ function renderFirePopup() {
 
   const feat = clickFeatures[clickIndex];
   if (feat && feat.id !== undefined) {
-    const sourceId = feat.source || (feat.layer ? feat.layer.source : null);
-    if (popupActiveId !== null && (popupActiveId !== feat.id || popupActiveSource !== sourceId)) {
+    if (popupActiveId !== null && popupActiveId !== feat.id) {
       try {
-        map.setFeatureState({ source: popupActiveSource, id: popupActiveId }, { popup: false });
+        map.setFeatureState({ source: 'fires-lowres-source', id: popupActiveId }, { popup: false });
+        map.setFeatureState({ source: 'fires-midres-source', id: popupActiveId }, { popup: false });
+        map.setFeatureState({ source: 'fires-source', id: popupActiveId }, { popup: false });
       } catch (err) {}
     }
     popupActiveId = feat.id;
-    popupActiveSource = sourceId;
-    if (popupActiveSource) {
-      try {
-        map.setFeatureState({ source: popupActiveSource, id: popupActiveId }, { popup: true });
-      } catch (err) {}
-    }
+    try {
+      map.setFeatureState({ source: 'fires-lowres-source', id: popupActiveId }, { popup: true });
+      map.setFeatureState({ source: 'fires-midres-source', id: popupActiveId }, { popup: true });
+      map.setFeatureState({ source: 'fires-source', id: popupActiveId }, { popup: true });
+    } catch (err) {}
   }
 
   if (currentPopup && currentPopup.isOpen()) {
@@ -751,9 +1024,11 @@ function renderFirePopup() {
       .setHTML(html);
 
     currentPopup.on('close', () => {
-      if (popupActiveId !== null && popupActiveSource) {
+      if (popupActiveId !== null) {
         try {
-          map.setFeatureState({ source: popupActiveSource, id: popupActiveId }, { popup: false });
+          map.setFeatureState({ source: 'fires-lowres-source', id: popupActiveId }, { popup: false });
+          map.setFeatureState({ source: 'fires-midres-source', id: popupActiveId }, { popup: false });
+          map.setFeatureState({ source: 'fires-source', id: popupActiveId }, { popup: false });
         } catch (err) {}
         popupActiveId = null;
         popupActiveSource = null;
@@ -805,7 +1080,7 @@ map.getCanvas().addEventListener('contextmenu', (e) => {
 
 // Close popup when clicking on empty map area
 map.on('click', (e) => {
-  const features = map.queryRenderedFeatures(e.point, { layers: ['fires-fill'] });
+  const features = map.queryRenderedFeatures(e.point, { layers: ['fires-fill', 'fires-fill-midres', 'fires-fill-lowres'] });
   if (features.length === 0 && currentPopup && currentPopup.isOpen()) {
     currentPopup.remove();
   }
@@ -1018,151 +1293,183 @@ function updateBorders() {
   }
 }
 
-function processFeatures(features) {
-  for (let i = 0; i < features.length; i++) {
-    const props = features[i].properties;
-    if (props) {
-      const ad = props.ad;
-      let se = 4; // Default to Winter (4)
-      if (ad && ad.length >= 7) {
-        const m = parseInt(ad.slice(5, 7), 10);
-        if (m >= 3 && m <= 5) se = 1;      // Spring
-        else if (m >= 6 && m <= 8) se = 2; // Summer
-        else if (m >= 9 && m <= 11) se = 3;// Fall
-      }
-      props.se = se;
-    }
-  }
-}
-
 function loadInitialData() {
   const statusEl = document.getElementById('status');
   if (statusEl) statusEl.textContent = 'Loading low-res overview…';
 
   dataLoaded = false;
-  highResLoaded = false;
-  loadedStates = {};
-  highResFeatures = [];
+  loadedMidStates = {};
+  loadedHighStates = {};
+  loadedMidres = [];
+  loadedHighres = [];
+  allFeatures = [];
 
-  // 1. Fetch low-res overview
-  fetch('./fires_lowres.geojson')
-    .then(r => {
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      return r.json();
-    })
-    .then(geojson => {
-      const features = geojson.features || [];
-      processFeatures(features);
-      
-      // Populate allFeatures immediately for stats & search
-      allFeatures = features;
-      dataLoaded = true;
-
-      // Add low-res source and layers
-      if (!map.getSource('fires-lowres-source')) {
-        map.addSource('fires-lowres-source', {
-          type: 'geojson',
-          data: geojson,
-          generateId: true,
-          tolerance: 0
-        });
-
-        const colorExpr = buildColorExpression();
-        const filterExpr = buildMapFilter();
-
-        map.addLayer({
-          id: 'fires-fill-lowres',
-          type: 'fill',
-          source: 'fires-lowres-source',
-          maxzoom: 7,
-          filter: filterExpr,
-          paint: {
-            'fill-color': colorExpr,
-            'fill-opacity': ['case',
-              ['any', ['boolean', ['feature-state', 'hover'], false], ['boolean', ['feature-state', 'popup'], false]],
-              Math.min(opacityVal + 0.35, 1.0),
-              opacityVal * 0.75
-            ],
-            'fill-antialias': true
-          }
-        });
-
-        map.addLayer({
-          id: 'fires-outline-lowres',
-          type: 'line',
-          source: 'fires-lowres-source',
-          maxzoom: 7,
-          filter: filterExpr,
-          paint: {
-            'line-color': colorExpr,
-            'line-width': ['interpolate', ['linear'], ['zoom'],
-              5, 0.3,
-              7, 0.6
-            ],
-            'line-opacity': 1.0
-          }
-        });
-
-        setupFireLayerEvents('fires-fill-lowres', 'fires-lowres-source');
-      }
-
-      // Add empty high-res source (initially empty) and layers
-      if (!map.getSource('fires-source')) {
-        map.addSource('fires-source', {
-          type: 'geojson',
-          data: { type: 'FeatureCollection', features: [] },
-          generateId: true,
-          tolerance: 0
-        });
-
-        const colorExpr = buildColorExpression();
-        const filterExpr = buildMapFilter();
-
-        map.addLayer({
-          id: 'fires-fill',
-          type: 'fill',
-          source: 'fires-source',
-          minzoom: 7,
-          filter: filterExpr,
-          paint: {
-            'fill-color': colorExpr,
-            'fill-opacity': ['case',
-              ['any', ['boolean', ['feature-state', 'hover'], false], ['boolean', ['feature-state', 'popup'], false]],
-              Math.min(opacityVal + 0.35, 1.0),
-              opacityVal * 0.75
-            ],
-            'fill-antialias': true
-          }
-        });
-
-        map.addLayer({
-          id: 'fires-outline',
-          type: 'line',
-          source: 'fires-source',
-          minzoom: 7,
-          filter: filterExpr,
-          paint: {
-            'line-color': colorExpr,
-            'line-width': ['interpolate', ['linear'], ['zoom'],
-              7, 0.6,
-              9, 0.8,
-              12, 1.2
-            ],
-            'line-opacity': 1.0
-          }
-        });
-
-        setupFireLayerEvents('fires-fill', 'fires-source');
-      }
-
-      applyFireLayers();
-    })
-    .catch(err => {
+  // 1. Fetch low-res overview using Worker
+  fetchGeoJSONWithWorker('./fires_lowres.geojson', 'lowres', (err, geojson) => {
+    if (err) {
       console.error('Error loading data:', err);
       if (statusEl && !dataLoaded) {
         statusEl.textContent = 'Error loading fires';
       }
-    });
+      return;
+    }
+
+    const features = geojson.features || [];
+    
+    // Store low-res features
+    allFeatures = features;
+    dataLoaded = true;
+
+    // Add low-res source and layers
+    if (!map.getSource('fires-lowres-source')) {
+      map.addSource('fires-lowres-source', {
+        type: 'geojson',
+        data: geojson,
+        generateId: false,
+        tolerance: 0
+      });
+
+      const colorExpr = buildColorExpression();
+      const filterExprLow = buildMapFilter(true, false);
+
+      map.addLayer({
+        id: 'fires-fill-lowres',
+        type: 'fill',
+        source: 'fires-lowres-source',
+        maxzoom: 7.0,
+        filter: filterExprLow,
+        paint: {
+          'fill-color': colorExpr,
+          'fill-opacity': ['case',
+            ['any', ['boolean', ['feature-state', 'hover'], false], ['boolean', ['feature-state', 'popup'], false]],
+            Math.min(opacityVal + 0.35, 1.0),
+            opacityVal * 0.75
+          ],
+          'fill-antialias': true
+        }
+      });
+
+      map.addLayer({
+        id: 'fires-outline-lowres',
+        type: 'line',
+        source: 'fires-lowres-source',
+        maxzoom: 7.0,
+        filter: filterExprLow,
+        paint: {
+          'line-color': colorExpr,
+          'line-width': ['interpolate', ['linear'], ['zoom'],
+            3, 0.3,
+            6, 0.6
+          ],
+          'line-opacity': 1.0
+        }
+      });
+
+      setupFireLayerEvents('fires-fill-lowres', 'fires-lowres-source');
+    }
+
+    // Add empty mid-res source and layers
+    if (!map.getSource('fires-midres-source')) {
+      map.addSource('fires-midres-source', {
+        type: 'geojson',
+        data: { type: 'FeatureCollection', features: [] },
+        generateId: false,
+        tolerance: 0
+      });
+
+      const colorExpr = buildColorExpression();
+      const filterExprMid = buildMapFilter(false, true);
+
+      map.addLayer({
+        id: 'fires-fill-midres',
+        type: 'fill',
+        source: 'fires-midres-source',
+        minzoom: 7.0,
+        maxzoom: 10.0,
+        filter: filterExprMid,
+        paint: {
+          'fill-color': colorExpr,
+          'fill-opacity': ['case',
+            ['any', ['boolean', ['feature-state', 'hover'], false], ['boolean', ['feature-state', 'popup'], false]],
+            Math.min(opacityVal + 0.35, 1.0),
+            opacityVal * 0.75
+          ],
+          'fill-antialias': true
+        }
+      });
+
+      map.addLayer({
+        id: 'fires-outline-midres',
+        type: 'line',
+        source: 'fires-midres-source',
+        minzoom: 7.0,
+        maxzoom: 10.0,
+        filter: filterExprMid,
+        paint: {
+          'line-color': colorExpr,
+          'line-width': ['interpolate', ['linear'], ['zoom'],
+            7.0, 0.4,
+            10.0, 0.8
+          ],
+          'line-opacity': 1.0
+        }
+      });
+
+      setupFireLayerEvents('fires-fill-midres', 'fires-midres-source');
+    }
+
+    // Add empty high-res source and layers
+    if (!map.getSource('fires-source')) {
+      map.addSource('fires-source', {
+        type: 'geojson',
+        data: { type: 'FeatureCollection', features: [] },
+        generateId: false,
+        tolerance: 0
+      });
+
+      const colorExpr = buildColorExpression();
+      const filterExprHigh = buildMapFilter(false, false);
+
+      map.addLayer({
+        id: 'fires-fill',
+        type: 'fill',
+        source: 'fires-source',
+        minzoom: 10.0,
+        filter: filterExprHigh,
+        paint: {
+          'fill-color': colorExpr,
+          'fill-opacity': ['case',
+            ['any', ['boolean', ['feature-state', 'hover'], false], ['boolean', ['feature-state', 'popup'], false]],
+            Math.min(opacityVal + 0.35, 1.0),
+            opacityVal * 0.75
+          ],
+          'fill-antialias': true
+        }
+      });
+
+      map.addLayer({
+        id: 'fires-outline',
+        type: 'line',
+        source: 'fires-source',
+        minzoom: 10.0,
+        filter: filterExprHigh,
+        paint: {
+          'line-color': colorExpr,
+          'line-width': ['interpolate', ['linear'], ['zoom'],
+            10.0, 0.6,
+            12, 1.0,
+            15, 1.4
+          ],
+          'line-opacity': 1.0
+        }
+      });
+
+      setupFireLayerEvents('fires-fill', 'fires-source');
+    }
+
+    applyFireLayers();
+    updateViewportData();
+  });
 }
 
 // ---- Main map load ----
@@ -1195,9 +1502,13 @@ map.on('load', () => {
 document.getElementById('projection-select').addEventListener('change', e => {
   setupProjection(e.target.value);
   saveSettings();
+  updateViewportData();
 });
 
-document.getElementById('borders-select').addEventListener('change', updateBorders);
+document.getElementById('borders-select').addEventListener('change', () => {
+  updateBorders();
+  updateViewportData();
+});
 
 // ---- Filter event listeners ----
 function applyYearFilter() {
@@ -1253,6 +1564,9 @@ document.getElementById('opacity-slider').addEventListener('input', e => {
   if (map.getLayer('fires-fill-lowres')) {
     map.setPaintProperty('fires-fill-lowres', 'fill-opacity', opacityExpr);
   }
+  if (map.getLayer('fires-fill-midres')) {
+    map.setPaintProperty('fires-fill-midres', 'fill-opacity', opacityExpr);
+  }
   if (map.getLayer('fires-fill')) {
     map.setPaintProperty('fires-fill', 'fill-opacity', opacityExpr);
   }
@@ -1287,6 +1601,7 @@ document.getElementById('theme-select').addEventListener('change', e => {
 document.getElementById('terrain-select').addEventListener('change', e => {
   setupTerrain(e.target.value, terrainExaggeration);
   saveSettings();
+  updateViewportData();
 });
 
 document.getElementById('terrain-exaggeration').addEventListener('input', e => {
@@ -1294,6 +1609,7 @@ document.getElementById('terrain-exaggeration').addEventListener('input', e => {
   if (!isNaN(val)) {
     setupTerrain(terrainMode, val);
     saveSettings();
+    updateViewportData();
   }
 });
 
@@ -1498,6 +1814,147 @@ if (searchInput) {
         firstResult.click();
       }
     }
+  });
+}
+
+// Mobile Search Logic
+window.openMobileSearch = () => {
+  const modal = document.getElementById('mobile-search-modal');
+  if (modal) {
+    modal.style.display = 'flex';
+    const input = document.getElementById('mobile-search-input');
+    if (input) input.focus();
+  }
+};
+
+window.closeMobileSearch = () => {
+  const modal = document.getElementById('mobile-search-modal');
+  if (modal) {
+    modal.style.display = 'none';
+    const input = document.getElementById('mobile-search-input');
+    if (input) input.value = '';
+    const results = document.getElementById('mobile-search-results');
+    if (results) results.innerHTML = '';
+  }
+};
+
+const mobileSearchInput = document.getElementById('mobile-search-input');
+const mobileSearchResults = document.getElementById('mobile-search-results');
+let mobileSearchTimeout = null;
+
+if (mobileSearchInput) {
+  mobileSearchInput.addEventListener('input', (e) => {
+    clearTimeout(mobileSearchTimeout);
+    const q = e.target.value.trim();
+    if (q.length < 2) {
+      if (mobileSearchResults) mobileSearchResults.innerHTML = '';
+      return;
+    }
+    mobileSearchTimeout = setTimeout(() => {
+      const matchedFires = searchFires(q);
+      searchPlaces(q, (matchedPlaces) => {
+        renderMobileSearchResults(matchedFires, matchedPlaces);
+      });
+    }, 350);
+  });
+
+  mobileSearchInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      if (mobileSearchResults) {
+        const firstResult = mobileSearchResults.querySelector('.mobile-result-item');
+        if (firstResult) {
+          firstResult.click();
+        }
+      }
+    }
+  });
+}
+
+function renderMobileSearchResults(fires, places) {
+  if (!mobileSearchResults) return;
+  let html = '';
+
+  if (fires.length > 0) {
+    html += `<div class="search-results-section-header">Fires</div>`;
+    fires.forEach((f, idx) => {
+      const name = f.properties.n || 'Unnamed';
+      const year = f.properties.y || '';
+      const acresVal = f.properties.ac || 0;
+      const valueText = formatAcresValue(acresVal);
+      const unit = UNIT_LABEL[currentUnits] || 'acres';
+
+      const yearColor = interpolateColor(YEAR_COLOR_STOPS, year);
+      const sizeColor = interpolateColor(SIZE_COLOR_STOPS, acresVal);
+      const yearSpan = year ? `<span style="color:${yearColor}; font-weight:600;">${year}</span>` : '';
+      const sizeSpan = acresVal ? `<span style="color:${sizeColor}; font-weight:600;">${valueText}</span> <span style="color:var(--text-dim);">${unit}</span>` : '';
+      const separator = (year && acresVal) ? ` <span style="color:var(--text-dim);">·</span> ` : '';
+
+      html += `
+        <div class="mobile-result-item" data-type="fire" data-index="${idx}">
+          <strong>${escHtml(name)} Fire</strong>
+          <span style="font-size:11px;">${yearSpan}${separator}${sizeSpan}</span>
+        </div>
+      `;
+    });
+  }
+
+  if (places.length > 0) {
+    html += `<div class="search-results-section-header">Places</div>`;
+    places.forEach((p) => {
+      html += `
+        <div class="mobile-result-item" data-type="place" data-lat="${p.lat}" data-lon="${p.lon}">
+          <span>${escHtml(p.display_name)}</span>
+        </div>
+      `;
+    });
+  }
+
+  if (fires.length === 0 && places.length === 0) {
+    html = `<div style="padding: 15px 20px; font-size: 14px; color: var(--text-dim);">No results found</div>`;
+  }
+
+  mobileSearchResults.innerHTML = html;
+
+  const items = mobileSearchResults.querySelectorAll('.mobile-result-item');
+  items.forEach(item => {
+    item.addEventListener('click', () => {
+      const type = item.getAttribute('data-type');
+      if (type === 'fire') {
+        const idx = parseInt(item.getAttribute('data-index'));
+        const feat = fires[idx];
+        const center = getGeometryCenter(feat.geometry);
+        if (center) {
+          if (center.bounds) {
+            map.fitBounds(center.bounds, { padding: 40, maxZoom: 14 });
+          } else {
+            map.flyTo({ center: [center.lng, center.lat], zoom: 12 });
+          }
+
+          clickFeatures = [feat];
+          clickIndex = 0;
+          currentPopupLngLat = new maplibregl.LngLat(center.lng, center.lat);
+          currentCounty = '';
+          renderFirePopup();
+
+          fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${center.lat}&lon=${center.lng}&zoom=10`)
+            .then(r => r.json())
+            .then(data => {
+              if (data && data.address && data.address.county) {
+                currentCounty = data.address.county;
+                if (currentPopup && currentPopup.isOpen()) renderFirePopup();
+              }
+            })
+            .catch(() => { });
+        }
+      } else if (type === 'place') {
+        const lat = parseFloat(item.getAttribute('data-lat'));
+        const lon = parseFloat(item.getAttribute('data-lon'));
+        map.flyTo({ center: [lon, lat], zoom: 10 });
+      }
+
+      closeMobileSearch();
+    });
   });
 }
 
